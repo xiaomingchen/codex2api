@@ -184,6 +184,10 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		if isProOnlyModel(model) {
 			return auth.NormalizePlanType(account.GetPlanType()) == "pro"
 		}
+		// 如果账号配置了模型列表，只允许列表中的模型通过
+		if model != "" && len(account.Models) > 0 {
+			return modelIDInList(model, account.Models)
+		}
 		return true
 	}
 }

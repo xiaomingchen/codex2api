@@ -263,8 +263,8 @@ export default function Accounts() {
     "all" | "pro" | "prolite" | "plus" | "team" | "free"
   >("all");
   const [sortKey, setSortKey] = useState<
-    "requests" | "usage" | "importTime" | null
-  >(null);
+    "score" | "requests" | "usage" | "importTime" | null
+  >("score");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: "",
@@ -652,7 +652,9 @@ export default function Accounts() {
     if (!sortKey) return filteredAccounts;
     return [...filteredAccounts].sort((a, b) => {
       let diff = 0;
-      if (sortKey === "requests") {
+      if (sortKey === "score") {
+        diff = getDispatchScore(a) - getDispatchScore(b);
+      } else if (sortKey === "requests") {
         diff =
           (a.success_requests ?? 0) +
           (a.error_requests ?? 0) -
@@ -2595,8 +2597,26 @@ export default function Accounts() {
                           </TableHead>
                         )}
                         {visibleColumns.status && (
-                          <TableHead className="text-[13px] font-semibold">
-                            {t("accounts.status")}
+                          <TableHead
+                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
+                            onClick={() => {
+                              if (sortKey === "score") {
+                                setSortDir((d) =>
+                                  d === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("score");
+                                setSortDir("desc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.status")}{" "}
+                            {sortKey === "score"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.requests && (
@@ -2805,6 +2825,14 @@ export default function Accounts() {
                                         "-",
                                     })}
                                   </div>
+                                  {(account.active_requests ?? 0) > 0 && (
+                                    <div className="text-[11px] font-medium text-blue-600 dark:text-blue-400">
+                                      {t("accounts.activeRequests")}: {account.active_requests}
+                                      {(account.dynamic_concurrency_limit ?? 0) > 0
+                                        ? ` / ${account.dynamic_concurrency_limit}`
+                                        : ""}
+                                    </div>
+                                  )}
                                 </div>
                               </TableCell>
                             )}
@@ -5911,6 +5939,14 @@ function formatCompactUsageNumber(value?: number): string {
   return String(n);
 }
 
+function formatCompactCost(value?: number): string {
+  const n = Number(value || 0);
+  if (n <= 0) return "";
+  if (n >= 100) return `${n.toLocaleString(undefined, { maximumFractionDigits: 1 })}`;
+  if (n >= 1) return `${n.toFixed(2)}`;
+  return `${n.toFixed(4)}`;
+}
+
 function hasUsageWindowDetail(detail?: AccountRow["usage_5h_detail"]): boolean {
   return Boolean(
     detail && ((detail.requests ?? 0) > 0 || (detail.tokens ?? 0) > 0),
@@ -5941,6 +5977,12 @@ function UsageBar({
   const detailText = hasUsageWindowDetail(detail)
     ? `${formatCompactUsageNumber(detail?.requests)} ${t("accounts.usageReqUnit")} / ${formatCompactUsageNumber(detail?.tokens)} ${t("accounts.usageTokUnit")}`
     : "";
+  const costText =
+    typeof detail?.user_billed === "number" && detail.user_billed > 0
+      ? formatCompactCost(detail.user_billed)
+      : typeof detail?.account_billed === "number" && detail.account_billed > 0
+        ? formatCompactCost(detail.account_billed)
+        : "";
   return (
     <div>
       <div className="flex items-center gap-1.5">
@@ -5957,9 +5999,14 @@ function UsageBar({
           {pct.toFixed(1)}%
         </span>
       </div>
-      {detailText && (
+      {(detailText || costText) && (
         <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">
           {detailText}
+          {costText && (
+            <span className="font-semibold text-emerald-600 dark:text-emerald-400 ml-1.5">
+              {costText}
+            </span>
+          )}
         </div>
       )}
       {resetText && (

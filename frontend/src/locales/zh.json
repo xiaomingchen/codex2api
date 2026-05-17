@@ -138,7 +138,14 @@
     "timeRange6H": "6 小时",
     "timeRange24H": "24 小时",
     "timeRange7D": "7 天",
-    "timeRange30D": "30 天"
+    "timeRange30D": "30 天",
+    "accountConsumption": "账号消费统计",
+    "account": "账号",
+    "requestsLabel": "请求数",
+    "inputTokensLabel": "输入 Token",
+    "outputTokensLabel": "输出 Token",
+    "totalTokensLabel": "总 Token",
+    "costLabel": "费用"
   },
   "accounts": {
     "title": "账号管理",
@@ -240,6 +247,7 @@
     "outputTokens": "输出 Token",
     "reasoningTokens": "推理 Token",
     "cachedTokens": "缓存 Token",
+    "costDetail": "费用金额",
     "modelDistribution": "模型分布",
     "noUsageData": "暂无使用记录",
     "searchPlaceholder": "搜索邮箱或名称…",
@@ -248,6 +256,7 @@
     "resetIn": "重置: {{time}}",
     "usageReqUnit": "req",
     "usageTokUnit": "tok",
+    "activeRequests": "并发",
     "accountBilledLabel": "账号",
     "userBilledLabel": "用户",
     "quotaDistributionTitle": "额度分布",

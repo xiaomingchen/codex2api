@@ -189,6 +189,8 @@ export interface AccountUsageDetail {
   reasoning_tokens: number
   cached_tokens: number
   cache_hit_rate: number
+  account_billed: number
+  user_billed: number
   models: AccountModelStat[]
 }
 
@@ -605,6 +607,18 @@ export interface ChartModelPoint {
 export interface ChartAggregation {
   timeline: ChartTimelinePoint[]
   models: ChartModelPoint[]
+}
+
+export interface AccountUsageSummaryRow {
+  account_id: number
+  email: string
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  cached_tokens: number
+  user_billed: number
+  account_billed: number
 }
 
 export interface APIKeyRow {

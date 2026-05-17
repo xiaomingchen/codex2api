@@ -138,7 +138,14 @@
     "timeRange6H": "6h",
     "timeRange24H": "24h",
     "timeRange7D": "7d",
-    "timeRange30D": "30d"
+    "timeRange30D": "30d",
+    "accountConsumption": "Account Consumption",
+    "account": "Account",
+    "requestsLabel": "Requests",
+    "inputTokensLabel": "Input Tokens",
+    "outputTokensLabel": "Output Tokens",
+    "totalTokensLabel": "Total Tokens",
+    "costLabel": "Cost"
   },
   "accounts": {
     "title": "Accounts",
@@ -240,6 +247,7 @@
     "outputTokens": "Output Tokens",
     "reasoningTokens": "Reasoning Tokens",
     "cachedTokens": "Cached Tokens",
+    "costDetail": "Cost",
     "modelDistribution": "Model Distribution",
     "noUsageData": "No usage data yet",
     "searchPlaceholder": "Search email or name…",
@@ -248,6 +256,7 @@
     "resetIn": "Reset: {{time}}",
     "usageReqUnit": "req",
     "usageTokUnit": "tok",
+    "activeRequests": "Concurrency",
     "accountBilledLabel": "Account",
     "userBilledLabel": "User",
     "quotaDistributionTitle": "Quota Distribution",

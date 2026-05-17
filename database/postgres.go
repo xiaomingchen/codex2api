@@ -2331,6 +2331,108 @@ type AccountEventPoint struct {
 	Deleted int    `json:"deleted"`
 }
 
+// AccountUsageSummaryRow 按账号聚合的时段用量统计行
+type AccountUsageSummaryRow struct {
+	AccountID     int64   `json:"account_id"`
+	Email         string  `json:"email"`
+	Requests      int64   `json:"requests"`
+	InputTokens   int64   `json:"input_tokens"`
+	OutputTokens  int64   `json:"output_tokens"`
+	TotalTokens   int64   `json:"total_tokens"`
+	CachedTokens  int64   `json:"cached_tokens"`
+	UserBilled    float64 `json:"user_billed"`
+	AccountBilled float64 `json:"account_billed"`
+}
+
+// GetAccountUsageSummary 查询指定时间范围内各账号的用量汇总
+func (db *DB) GetAccountUsageSummary(ctx context.Context, start, end time.Time) ([]AccountUsageSummaryRow, error) {
+	startArg, endArg := db.timeRangeArgs(start, end)
+	// 先按 account_id 聚合用量
+	query := `SELECT
+		account_id,
+		COUNT(*) AS requests,
+		COALESCE(SUM(input_tokens), 0) AS input_tokens,
+		COALESCE(SUM(output_tokens), 0) AS output_tokens,
+		COALESCE(SUM(total_tokens), 0) AS total_tokens,
+		COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+		COALESCE(SUM(user_billed), 0) AS user_billed,
+		COALESCE(SUM(account_billed), 0) AS account_billed
+	FROM usage_logs
+	WHERE created_at >= $1 AND created_at <= $2 AND status_code <> 499
+	GROUP BY account_id
+	ORDER BY user_billed DESC, requests DESC`
+	rows, err := db.conn.QueryContext(ctx, query, startArg, endArg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// 收集所有 account_id，之后一次性查询 email
+	type rawRow struct {
+		AccountID     int64
+		Requests      int64
+		InputTokens   int64
+		OutputTokens  int64
+		TotalTokens   int64
+		CachedTokens  int64
+		UserBilled    float64
+		AccountBilled float64
+	}
+	var raws []rawRow
+	for rows.Next() {
+		var r rawRow
+		if err := rows.Scan(&r.AccountID, &r.Requests, &r.InputTokens, &r.OutputTokens, &r.TotalTokens, &r.CachedTokens, &r.UserBilled, &r.AccountBilled); err != nil {
+			return nil, err
+		}
+		raws = append(raws, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 批量查询邮箱
+	emailMap := make(map[int64]string)
+	if len(raws) > 0 {
+		ids := make([]interface{}, len(raws))
+		placeholders := make([]string, len(raws))
+		for i, r := range raws {
+			ids[i] = r.AccountID
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+		}
+		emailQuery := fmt.Sprintf("SELECT id, COALESCE(CAST(credentials AS TEXT), '{}') FROM accounts WHERE id IN (%s)", strings.Join(placeholders, ","))
+		eRows, err := db.conn.QueryContext(ctx, emailQuery, ids...)
+		if err == nil {
+			defer eRows.Close()
+			for eRows.Next() {
+				var id int64
+				var credRaw string
+				if err := eRows.Scan(&id, &credRaw); err == nil {
+					emailMap[id] = accountEmailFromRawCredentials(credRaw)
+				}
+			}
+		}
+	}
+
+	result := make([]AccountUsageSummaryRow, 0, len(raws))
+	for _, r := range raws {
+		result = append(result, AccountUsageSummaryRow{
+			AccountID:     r.AccountID,
+			Email:         emailMap[r.AccountID],
+			Requests:      r.Requests,
+			InputTokens:   r.InputTokens,
+			OutputTokens:  r.OutputTokens,
+			TotalTokens:   r.TotalTokens,
+			CachedTokens:  r.CachedTokens,
+			UserBilled:    r.UserBilled,
+			AccountBilled: r.AccountBilled,
+		})
+	}
+	if result == nil {
+		result = []AccountUsageSummaryRow{}
+	}
+	return result, nil
+}
+
 // AccountModelStat 单个模型的使用统计
 type AccountModelStat struct {
 	Model    string `json:"model"`
@@ -2346,6 +2448,8 @@ type AccountUsageDetail struct {
 	OutputTokens    int64              `json:"output_tokens"`
 	ReasoningTokens int64              `json:"reasoning_tokens"`
 	CachedTokens    int64              `json:"cached_tokens"`
+	AccountBilled   float64            `json:"account_billed"`
+	UserBilled      float64            `json:"user_billed"`
 	Models          []AccountModelStat `json:"models"`
 }
 
@@ -2444,7 +2548,9 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64) (*Accou
 		COALESCE(SUM(input_tokens), 0),
 		COALESCE(SUM(output_tokens), 0),
 		COALESCE(SUM(reasoning_tokens), 0),
-		COALESCE(SUM(cached_tokens), 0)
+		COALESCE(SUM(cached_tokens), 0),
+		COALESCE(SUM(account_billed), 0),
+		COALESCE(SUM(user_billed), 0)
 	FROM usage_logs
 	WHERE account_id = $1 AND status_code <> 499`
 
@@ -2452,6 +2558,7 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64) (*Accou
 		&result.TotalRequests, &result.TotalTokens,
 		&result.InputTokens, &result.OutputTokens,
 		&result.ReasoningTokens, &result.CachedTokens,
+		&result.AccountBilled, &result.UserBilled,
 	); err != nil {
 		return nil, err
 	}

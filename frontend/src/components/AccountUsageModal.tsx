@@ -98,11 +98,20 @@ export default function AccountUsageModal({ account, onClose }: Props) {
             <StatRow label={t('accounts.outputTokens')} value={data.output_tokens.toLocaleString()} />
             <StatRow label={t('accounts.reasoningTokens')} value={data.reasoning_tokens.toLocaleString()} />
             <StatRow label={t('accounts.cachedTokens')} value={data.cached_tokens.toLocaleString()} />
+            <div className="h-px bg-border" />
+            <StatRow label={t('accounts.costDetail')} value={formatCost(data.user_billed || data.account_billed)} highlight />
           </div>
         </div>
       )}
     </Modal>
   )
+}
+
+function formatCost(value: number): string {
+  if (!value || value <= 0) return '$0.00'
+  if (value >= 100) return `${value.toLocaleString(undefined, { maximumFractionDigits: 1 })}`
+  if (value >= 1) return `${value.toFixed(2)}`
+  return `${value.toFixed(4)}`
 }
 
 function StatRow({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {

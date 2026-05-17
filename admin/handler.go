@@ -224,6 +224,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/usage/stats", h.GetUsageStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
+	api.GET("/usage/account-summary", h.GetAccountUsageSummary)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
 	api.GET("/keys", h.ListAPIKeys)
 	api.POST("/keys", h.CreateAPIKey)
@@ -2584,6 +2585,26 @@ func (h *Handler) GetChartData(c *gin.Context) {
 	h.chartCacheMu.Unlock()
 
 	c.JSON(http.StatusOK, result)
+}
+
+// GetAccountUsageSummary 返回指定时间范围内各账号的用量汇总
+func (h *Handler) GetAccountUsageSummary(c *gin.Context) {
+	startStr := c.Query("start")
+	endStr := c.Query("end")
+	startTime, e1 := time.Parse(time.RFC3339, startStr)
+	endTime, e2 := time.Parse(time.RFC3339, endStr)
+	if e1 != nil || e2 != nil {
+		writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	rows, err := h.db.GetAccountUsageSummary(ctx, startTime, endTime)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"accounts": rows})
 }
 
 func parseOpsErrorPositiveInt64(c *gin.Context, name string) (*int64, bool) {

@@ -1,6 +1,7 @@
 import type {
   AccountEventTrendPoint,
   AccountUsageDetail,
+  AccountUsageSummaryRow,
   AddAccountRequest,
   AddATAccountRequest,
   AddOpenAIResponsesAccountRequest,
@@ -303,6 +304,12 @@ export const api = {
     searchParams.set('end', params.end)
     searchParams.set('bucket_minutes', String(params.bucketMinutes))
     return request<ChartAggregation>(`/usage/chart-data?${searchParams.toString()}`)
+  },
+  getAccountUsageSummary: (params: { start: string; end: string }) => {
+    const searchParams = new URLSearchParams()
+    searchParams.set('start', params.start)
+    searchParams.set('end', params.end)
+    return request<{ accounts: AccountUsageSummaryRow[] }>(`/usage/account-summary?${searchParams.toString()}`)
   },
   getAccountEventTrend: (params: { start: string; end: string; bucketMinutes: number }) => {
     const sp = new URLSearchParams()
