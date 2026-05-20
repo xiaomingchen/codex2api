@@ -205,6 +205,43 @@ func (h *Handler) DeleteAccountGroup(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "分组已删除")
 }
 
+func (h *Handler) AssignUngroupedAccountsToGroup(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的分组 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	missing, err := h.db.VerifyAccountGroupIDs(ctx, []int64{id})
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if len(missing) > 0 {
+		writeError(c, http.StatusNotFound, "分组不存在")
+		return
+	}
+
+	assignedIDs, err := h.db.AssignUngroupedAccountsToGroup(ctx, id)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if h.store != nil {
+		for _, accountID := range assignedIDs {
+			h.store.ApplyAccountGroups(accountID, []int64{id})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "未分组账号已分配到分组",
+		"assigned": len(assignedIDs),
+	})
+}
+
 func (h *Handler) refreshAPIKeyAllowedGroupsAfterGroupDelete(ctx context.Context, groupID int64) {
 	if h == nil || h.db == nil || groupID <= 0 {
 		return

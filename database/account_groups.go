@@ -277,6 +277,65 @@ func (db *DB) SetAccountGroups(ctx context.Context, accountID int64, groupIDs []
 	return tx.Commit()
 }
 
+func (db *DB) AssignUngroupedAccountsToGroup(ctx context.Context, groupID int64) ([]int64, error) {
+	if groupID <= 0 {
+		return nil, fmt.Errorf("group id is required")
+	}
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT a.id
+		FROM accounts a
+		WHERE a.status <> 'deleted'
+			AND COALESCE(a.error_message, '') <> 'deleted'
+			AND NOT EXISTS (
+				SELECT 1
+				FROM account_group_members m
+				WHERE m.account_id = a.id
+			)
+		ORDER BY a.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	assignedIDs := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		assignedIDs = append(assignedIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(assignedIDs) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return assignedIDs, nil
+	}
+
+	insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
+	if db.isSQLite() {
+		insertQ = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
+	}
+	for _, accountID := range assignedIDs {
+		if _, err := tx.ExecContext(ctx, insertQ, accountID, groupID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return assignedIDs, nil
+}
+
 func (db *DB) GetAccountGroupIDs(ctx context.Context, accountID int64) ([]int64, error) {
 	query := "SELECT group_id FROM account_group_members WHERE account_id = $1 ORDER BY group_id"
 	if db.isSQLite() {

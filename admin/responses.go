@@ -25,7 +25,30 @@ type statsResponse struct {
 }
 
 type accountsResponse struct {
-	Accounts []accountResponse `json:"accounts"`
+	Accounts      []accountResponse          `json:"accounts"`
+	Total         int                        `json:"total"`
+	Page          int                        `json:"page"`
+	PageSize      int                        `json:"page_size"`
+	TotalPages    int                        `json:"total_pages"`
+	Summary       accountListSummaryResponse `json:"summary"`
+	AvailableTags []string                   `json:"available_tags"`
+}
+
+type accountListSummaryResponse struct {
+	TotalAccounts              int `json:"total_accounts"`
+	NormalAccounts             int `json:"normal_accounts"`
+	RateLimitedAccounts        int `json:"rate_limited_accounts"`
+	RateLimited5hAccounts      int `json:"rate_limited_5h_accounts"`
+	RateLimited7dAccounts      int `json:"rate_limited_7d_accounts"`
+	AbnormalAccounts           int `json:"abnormal_accounts"`
+	BannedAccounts             int `json:"banned_accounts"`
+	ErrorAccounts              int `json:"error_accounts"`
+	DisabledAccounts           int `json:"disabled_accounts"`
+	LockedAccounts             int `json:"locked_accounts"`
+	SubscriptionAccountsToLock int `json:"subscription_accounts_to_lock"`
+	HealthyAccounts            int `json:"healthy_accounts"`
+	WarmAccounts               int `json:"warm_accounts"`
+	RiskyAccounts              int `json:"risky_accounts"`
 }
 
 type createAccountResponse struct {

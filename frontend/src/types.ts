@@ -95,7 +95,45 @@ export interface AccountRow {
   image_quota_reset_at?: ISODateString
 }
 
-export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
+export interface AccountListQuery {
+  page?: number
+  page_size?: number
+  status?: 'all' | 'normal' | 'rate_limited' | 'abnormal' | 'banned' | 'error' | 'disabled' | 'locked'
+  plan?: 'all' | 'pro' | 'prolite' | 'plus' | 'team' | 'free'
+  q?: string
+  tag?: string
+  group_id?: string
+  sort_key?: 'score' | 'requests' | 'usage' | 'importTime' | 'updatedAt'
+  sort_dir?: 'asc' | 'desc'
+  all?: boolean
+}
+
+export interface AccountListSummary {
+  total_accounts: number
+  normal_accounts: number
+  rate_limited_accounts: number
+  rate_limited_5h_accounts: number
+  rate_limited_7d_accounts: number
+  abnormal_accounts: number
+  banned_accounts: number
+  error_accounts: number
+  disabled_accounts: number
+  locked_accounts: number
+  subscription_accounts_to_lock: number
+  healthy_accounts: number
+  warm_accounts: number
+  risky_accounts: number
+}
+
+export interface AccountsResponse {
+  accounts: AccountRow[]
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+  summary: AccountListSummary
+  available_tags: string[]
+}
 
 export interface AddAccountRequest {
   name?: string
@@ -159,6 +197,11 @@ export interface AccountGroup {
 
 export interface AccountGroupsResponse {
   groups: AccountGroup[]
+}
+
+export interface AssignUngroupedAccountsResponse {
+  message: string
+  assigned: number
 }
 
 export interface CreateAccountGroupRequest {

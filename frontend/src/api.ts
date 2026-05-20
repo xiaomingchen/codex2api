@@ -44,6 +44,8 @@ import type {
   UsageStats,
   AccountGroup,
   AccountGroupsResponse,
+  AccountListQuery,
+  AssignUngroupedAccountsResponse,
   CreateAccountGroupRequest,
   UpdateAccountGroupRequest,
 } from './types'
@@ -186,10 +188,32 @@ function buildOpsErrorSearchParams(params: {
   return search
 }
 
+function buildAccountSearchParams(params?: AccountListQuery) {
+  const search = new URLSearchParams()
+  if (!params) return search
+
+  if (params.all) {
+    search.set('all', 'true')
+  }
+  if (params.page) search.set('page', String(params.page))
+  if (params.page_size) search.set('page_size', String(params.page_size))
+  if (params.status && params.status !== 'all') search.set('status', params.status)
+  if (params.plan && params.plan !== 'all') search.set('plan', params.plan)
+  if (params.q) search.set('q', params.q)
+  if (params.tag) search.set('tag', params.tag)
+  if (params.group_id && params.group_id !== 'all') search.set('group_id', params.group_id)
+  if (params.sort_key) search.set('sort_key', params.sort_key)
+  if (params.sort_dir) search.set('sort_dir', params.sort_dir)
+  return search
+}
+
 export const api = {
   getBranding: () => requestPublic<SiteBranding>('/api/branding'),
   getStats: () => request<StatsResponse>('/stats'),
-  getAccounts: () => request<AccountsResponse>('/accounts'),
+  getAccounts: (params?: AccountListQuery) => {
+    const search = buildAccountSearchParams(params)
+    return request<AccountsResponse>(`/accounts${search.toString() ? `?${search.toString()}` : ''}`)
+  },
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
@@ -211,6 +235,8 @@ export const api = {
     request<{ id: number; message: string }>('/account-groups', { method: 'POST', body: JSON.stringify(data) }),
   updateAccountGroup: (id: number, data: UpdateAccountGroupRequest) =>
     request<MessageResponse>(`/account-groups/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  assignUngroupedAccountsToGroup: (id: number) =>
+    request<AssignUngroupedAccountsResponse>(`/account-groups/${id}/assign-ungrouped`, { method: 'POST' }),
   deleteAccountGroup: (id: number, force = false) =>
     request<MessageResponse>(`/account-groups/${id}${force ? '?force=true' : ''}`, { method: 'DELETE' }),
   toggleAccountEnabled: (id: number, enabled: boolean) =>

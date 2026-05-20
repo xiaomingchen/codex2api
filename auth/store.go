@@ -43,6 +43,9 @@ const (
 
 const UpstreamOpenAIResponses = "openai_responses"
 
+var refreshWithRetryFn = RefreshWithRetry
+var refreshWithSessionTokenRetryFn = RefreshWithSessionTokenRetry
+
 // Account 运行时账号状态
 type Account struct {
 	mu             sync.RWMutex
@@ -1085,6 +1088,20 @@ func (a *Account) applyRefreshedPlanTypeLocked(planType string, now time.Time) (
 		return plan, false
 	}
 	a.PlanType = plan
+	return plan, true
+}
+
+func decideRefreshedPlanType(currentPlan string, usagePercent7dValid bool, reset7dAt time.Time, planType string, now time.Time) (string, bool) {
+	plan := strings.ToLower(strings.TrimSpace(planType))
+	if plan == "" {
+		return "", false
+	}
+	if plan != "free" &&
+		strings.EqualFold(strings.TrimSpace(currentPlan), "free") &&
+		usagePercent7dValid &&
+		reset7dAt.After(now) {
+		return plan, false
+	}
 	return plan, true
 }
 
@@ -4061,6 +4078,9 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 	rt := acc.RefreshToken
 	st := acc.SessionToken
 	dbID := acc.DBID
+	currentPlan := acc.PlanType
+	usagePercent7dValid := acc.UsagePercent7dValid
+	reset7dAt := acc.Reset7dAt
 	cooldownUntil := acc.CooldownUtil
 	cooldownReason := acc.CooldownReason
 	now := time.Now()
@@ -4158,13 +4178,13 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 	var td *TokenData
 	var info *AccountInfo
 	if rt != "" {
-		td, info, err = RefreshWithRetry(ctx, rt, proxy, resinID)
+		td, info, err = refreshWithRetryFn(ctx, rt, proxy, resinID)
 	} else {
 		err = fmt.Errorf("refresh_token 为空")
 	}
 	if err != nil && st != "" {
 		rtErr := err
-		if stTD, stInfo, stErr := RefreshWithSessionTokenRetry(ctx, st, proxy, resinID); stErr == nil {
+		if stTD, stInfo, stErr := refreshWithSessionTokenRetryFn(ctx, st, proxy, resinID); stErr == nil {
 			td, info, err = stTD, stInfo, nil
 			if td.RefreshToken == "" {
 				td.RefreshToken = rt
@@ -4187,9 +4207,43 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 		return err
 	}
 
-	// 4. 更新内存状态
-	appliedPlanType := ""
+	infoPlanType := ""
+	if info != nil {
+		infoPlanType = info.PlanType
+	}
+	appliedPlanType, applied := decideRefreshedPlanType(currentPlan, usagePercent7dValid, reset7dAt, infoPlanType, now)
 	skippedPlanType := ""
+	if infoPlanType != "" && !applied {
+		skippedPlanType = appliedPlanType
+	}
+
+	// 4. 先同步写入数据库，再更新内存状态
+	credentials := map[string]interface{}{
+		"access_token": td.AccessToken,
+		"id_token":     td.IDToken,
+		"expires_at":   td.ExpiresAt.Format(time.RFC3339),
+	}
+	if td.RefreshToken != "" {
+		credentials["refresh_token"] = td.RefreshToken
+	}
+	if st != "" {
+		credentials["session_token"] = st
+	}
+	if info != nil {
+		if info.ChatGPTAccountID != "" {
+			credentials["account_id"] = info.ChatGPTAccountID
+		}
+		if info.Email != "" {
+			credentials["email"] = info.Email
+		}
+		if applied {
+			credentials["plan_type"] = appliedPlanType
+		}
+	}
+	if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {
+		return fmt.Errorf("更新数据库失败: %w", err)
+	}
+
 	acc.mu.Lock()
 	acc.AccessToken = td.AccessToken
 	if td.RefreshToken != "" {
@@ -4206,13 +4260,9 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 			acc.Email = info.Email
 		}
 		// 不用空值覆盖已有的 PlanType，避免 plus 号被误标为 free
-		if info.PlanType != "" {
-			if plan, applied := acc.applyRefreshedPlanTypeLocked(info.PlanType, now); applied {
-				appliedPlanType = plan
-			} else {
-				skippedPlanType = plan
-			}
-		} else if acc.PlanType == "" {
+		if applied {
+			acc.PlanType = appliedPlanType
+		} else if acc.PlanType == "" && strings.TrimSpace(infoPlanType) == "" {
 			log.Printf("[账号 %d] 刷新后 plan_type 为空，无法识别套餐类型", dbID)
 		}
 	}
@@ -4236,33 +4286,6 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 	ttl := time.Until(td.ExpiresAt) - 5*time.Minute
 	if s.tokenCache != nil && ttl > 0 {
 		_ = s.tokenCache.SetAccessToken(ctx, dbID, td.AccessToken, ttl)
-	}
-
-	// 6. 更新数据库 credentials
-	credentials := map[string]interface{}{
-		"access_token": td.AccessToken,
-		"id_token":     td.IDToken,
-		"expires_at":   td.ExpiresAt.Format(time.RFC3339),
-	}
-	if td.RefreshToken != "" {
-		credentials["refresh_token"] = td.RefreshToken
-	}
-	if st != "" {
-		credentials["session_token"] = st
-	}
-	if info != nil {
-		if info.ChatGPTAccountID != "" {
-			credentials["account_id"] = info.ChatGPTAccountID
-		}
-		if info.Email != "" {
-			credentials["email"] = info.Email
-		}
-		if appliedPlanType != "" {
-			credentials["plan_type"] = appliedPlanType
-		}
-	}
-	if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {
-		log.Printf("[账号 %d] 更新数据库失败: %v", dbID, err)
 	}
 	if err := s.db.ClearError(ctx, dbID); err != nil {
 		log.Printf("[账号 %d] 清理错误状态失败: %v", dbID, err)

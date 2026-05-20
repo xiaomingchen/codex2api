@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { getErrorMessage } from '../utils/error'
 
 interface LoadOptions {
@@ -15,8 +15,10 @@ export function useDataLoader<T>({ initialData, load, onError }: UseDataLoaderOp
   const [data, setData] = useState<T>(initialData)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const requestIdRef = useRef(0)
 
   const run = useCallback(async (options: LoadOptions = {}) => {
+    const requestId = ++requestIdRef.current
     const { silent = false } = options
 
     if (!silent) {
@@ -26,10 +28,16 @@ export function useDataLoader<T>({ initialData, load, onError }: UseDataLoaderOp
 
     try {
       const nextData = await load()
+      if (requestId !== requestIdRef.current) {
+        return null
+      }
       setData(nextData)
       setError(null)
       return nextData
     } catch (err) {
+      if (requestId !== requestIdRef.current) {
+        return null
+      }
       const message = getErrorMessage(err)
       if (!silent) {
         setError(message)
@@ -37,7 +45,7 @@ export function useDataLoader<T>({ initialData, load, onError }: UseDataLoaderOp
       onError?.(message, err)
       return null
     } finally {
-      if (!silent) {
+      if (requestId === requestIdRef.current) {
         setLoading(false)
       }
     }

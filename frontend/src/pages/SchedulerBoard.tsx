@@ -28,7 +28,7 @@ export default function SchedulerBoard() {
   const loadSchedulerData = useCallback(async () => {
     const [overview, accountsResponse] = await Promise.all([
       api.getOpsOverview(),
-      api.getAccounts(),
+      api.getAccounts({ all: true }),
     ])
 
     return {

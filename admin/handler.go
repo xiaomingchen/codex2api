@@ -233,6 +233,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/account-groups", h.ListAccountGroups)
 	api.POST("/account-groups", h.CreateAccountGroup)
 	api.PATCH("/account-groups/:id", h.UpdateAccountGroup)
+	api.POST("/account-groups/:id/assign-ungrouped", h.AssignUngroupedAccountsToGroup)
 	api.DELETE("/account-groups/:id", h.DeleteAccountGroup)
 	api.GET("/health", h.GetHealth)
 	api.GET("/ops/overview", h.GetOpsOverview)
@@ -470,11 +471,18 @@ type schedulerBreakdownResponse struct {
 
 // ListAccounts 获取账号列表
 func (h *Handler) ListAccounts(c *gin.Context) {
+	query, ok := parseAccountListQuery(c)
+	if !ok {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	h.store.TriggerUsageProbeAsync()
-	h.store.TriggerRecoveryProbeAsync()
+	if h.store != nil {
+		h.store.TriggerUsageProbeAsync()
+		h.store.TriggerRecoveryProbeAsync()
+	}
 
 	rows, err := h.db.ListActive(ctx)
 	if err != nil {
@@ -484,8 +492,12 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	// 合并内存中的调度指标
 	accountMap := make(map[int64]*auth.Account)
-	for _, acc := range h.store.Accounts() {
-		accountMap[acc.DBID] = acc
+	maxConcurrency := int64(1)
+	if h.store != nil {
+		maxConcurrency = int64(h.store.GetMaxConcurrency())
+		for _, acc := range h.store.Accounts() {
+			accountMap[acc.DBID] = acc
+		}
 	}
 
 	// 获取每账号近 7 天请求统计（带 30 秒内存缓存）
@@ -524,7 +536,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),
 			ScoreBiasEffective:       effectiveScoreBias(planType, row.ScoreBiasOverride),
 			BaseConcurrencyOverride:  nullableInt64Pointer(row.BaseConcurrencyOverride),
-			BaseConcurrencyEffective: effectiveBaseConcurrency(row.BaseConcurrencyOverride, int64(h.store.GetMaxConcurrency())),
+			BaseConcurrencyEffective: effectiveBaseConcurrency(row.BaseConcurrencyOverride, maxConcurrency),
 			CreatedAt:                row.CreatedAt.Format(time.RFC3339),
 			UpdatedAt:                row.UpdatedAt.Format(time.RFC3339),
 		}
@@ -534,7 +546,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			acc.Mu().RUnlock()
 			resp.ActiveRequests = acc.GetActiveRequests()
 			resp.TotalRequests = acc.GetTotalRequests()
-			debug := acc.GetSchedulerDebugSnapshot(int64(h.store.GetMaxConcurrency()))
+			debug := acc.GetSchedulerDebugSnapshot(maxConcurrency)
 			resp.HealthTier = debug.HealthTier
 			resp.SchedulerScore = debug.SchedulerScore
 			resp.ConcurrencyCap = debug.DynamicConcurrencyLimit
@@ -636,7 +648,21 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		accounts = append(accounts, resp)
 	}
 
-	c.JSON(http.StatusOK, accountsResponse{Accounts: accounts})
+	summary := buildAccountListSummary(accounts)
+	availableTags := collectAccountTags(accounts)
+	filteredAccounts := filterAccountResponses(accounts, query)
+	sortAccountResponses(filteredAccounts, query.SortKey, query.SortDir)
+	pagedAccounts, page, pageSize, totalPages := paginateAccountResponses(filteredAccounts, query)
+
+	c.JSON(http.StatusOK, accountsResponse{
+		Accounts:      pagedAccounts,
+		Total:         len(filteredAccounts),
+		Page:          page,
+		PageSize:      pageSize,
+		TotalPages:    totalPages,
+		Summary:       summary,
+		AvailableTags: availableTags,
+	})
 }
 
 type updateAccountSchedulerReq struct {

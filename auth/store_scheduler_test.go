@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -176,6 +177,79 @@ func TestRefreshSingleBypassesCachedAccessToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "refresh_token 为空") {
 		t.Fatalf("RefreshSingle error = %v, want missing refresh_token", err)
+	}
+}
+
+func TestRefreshAccountReturnsDBErrorBeforeMutatingMemory(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = db.Close()
+		}
+	})
+
+	accountID, err := db.InsertAccount(ctx, "test-account", "rt-old", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 返回错误: %v", err)
+	}
+
+	store := &Store{db: db}
+	acc := &Account{
+		DBID:         accountID,
+		RefreshToken: "rt-old",
+		AccessToken:  "old-token",
+		PlanType:     "pro",
+		Status:       StatusReady,
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	store.AddAccount(acc)
+
+	oldRefreshFn := refreshWithRetryFn
+	refreshWithRetryFn = func(context.Context, string, string, ...string) (*TokenData, *AccountInfo, error) {
+		return &TokenData{
+				AccessToken:  "new-token",
+				RefreshToken: "rt-new",
+				IDToken:      "id-new",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			}, &AccountInfo{
+				Email:            "new@example.com",
+				ChatGPTAccountID: "acct-new",
+				PlanType:         "team",
+			}, nil
+	}
+	defer func() {
+		refreshWithRetryFn = oldRefreshFn
+	}()
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close 返回错误: %v", err)
+	}
+	closed = true
+
+	err = store.refreshAccount(ctx, acc)
+	if err == nil {
+		t.Fatal("refreshAccount 应该在数据库写入失败时返回错误")
+	}
+	if !strings.Contains(err.Error(), "更新数据库失败") && !strings.Contains(strings.ToLower(err.Error()), "closed") {
+		t.Fatalf("refreshAccount error = %v, want DB failure", err)
+	}
+	if got := acc.AccessToken; got != "old-token" {
+		t.Fatalf("AccessToken = %q, want %q", got, "old-token")
+	}
+	if got := acc.RefreshToken; got != "rt-old" {
+		t.Fatalf("RefreshToken = %q, want %q", got, "rt-old")
+	}
+	if got := acc.Email; got != "" {
+		t.Fatalf("Email = %q, want empty", got)
+	}
+	if got := acc.PlanType; got != "pro" {
+		t.Fatalf("PlanType = %q, want %q", got, "pro")
 	}
 }
 

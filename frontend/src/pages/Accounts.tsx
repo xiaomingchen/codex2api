@@ -12,6 +12,8 @@ import { useConfirmDialog } from "../hooks/useConfirmDialog";
 import { useToast } from "../hooks/useToast";
 import type {
   AccountRow,
+  AccountListQuery,
+  AccountListSummary,
   AddAccountRequest,
   AddATAccountRequest,
   AddOpenAIResponsesAccountRequest,
@@ -86,6 +88,7 @@ const ACCOUNT_TABLE_COLUMNS = [
   "groups",
   "plan",
   "status",
+  "concurrency",
   "requests",
   "usage",
   "importTime",
@@ -263,7 +266,7 @@ export default function Accounts() {
     "all" | "pro" | "prolite" | "plus" | "team" | "free"
   >("all");
   const [sortKey, setSortKey] = useState<
-    "score" | "requests" | "usage" | "importTime" | null
+    "score" | "requests" | "usage" | "importTime" | "updatedAt" | null
   >("score");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [addForm, setAddForm] = useState<AddAccountRequest>({
@@ -374,7 +377,7 @@ export default function Accounts() {
   const [editTags, setEditTags] = useState<string[]>([]);
   const [editGroupIds, setEditGroupIds] = useState<number[]>([]);
   const [tagFilter, setTagFilter] = useState<string>("");
-  const [groupFilter, setGroupFilter] = useState<number | null>(null);
+  const [groupFilter, setGroupFilter] = useState<string>("all");
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
   const [showGroupManager, setShowGroupManager] = useState(false);
   const [groupDraft, setGroupDraft] = useState<AccountGroupDraft>({
@@ -384,6 +387,9 @@ export default function Accounts() {
     color: ACCOUNT_GROUP_COLORS[0],
   });
   const [groupSubmitting, setGroupSubmitting] = useState(false);
+  const [assigningUngroupedGroupId, setAssigningUngroupedGroupId] = useState<
+    number | null
+  >(null);
   const [showBatchMetaEditor, setShowBatchMetaEditor] = useState(false);
   const [batchTags, setBatchTags] = useState<string[]>([]);
   const [batchGroupIds, setBatchGroupIds] = useState<number[]>([]);
@@ -399,10 +405,53 @@ export default function Accounts() {
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
 
+  const emptySummary: AccountListSummary = {
+    total_accounts: 0,
+    normal_accounts: 0,
+    rate_limited_accounts: 0,
+    rate_limited_5h_accounts: 0,
+    rate_limited_7d_accounts: 0,
+    abnormal_accounts: 0,
+    banned_accounts: 0,
+    error_accounts: 0,
+    disabled_accounts: 0,
+    locked_accounts: 0,
+    subscription_accounts_to_lock: 0,
+    healthy_accounts: 0,
+    warm_accounts: 0,
+    risky_accounts: 0,
+  };
+  const accountQuery = useMemo<AccountListQuery>(
+    () => ({
+      page,
+      page_size: pageSize,
+      status: statusFilter,
+      plan: planFilter,
+      q: searchQuery.trim() || undefined,
+      tag: tagFilter || undefined,
+      group_id: groupFilter,
+      sort_key: sortKey ?? "score",
+      sort_dir: sortDir,
+    }),
+    [
+      groupFilter,
+      page,
+      pageSize,
+      planFilter,
+      searchQuery,
+      sortDir,
+      sortKey,
+      statusFilter,
+      tagFilter,
+    ],
+  );
+  const accountQueryRef = useRef<AccountListQuery>(accountQuery);
+  const queryMountedRef = useRef(false);
+
   const loadAccounts = useCallback(async () => {
     const [accountsResponse, apiKeysResponse, opsOverview, groupsResponse] =
       await Promise.all([
-        api.getAccounts(),
+        api.getAccounts(accountQueryRef.current),
         api.getAPIKeys(),
         api.getOpsOverview().catch((): OpsOverviewResponse | null => null),
         api.listAccountGroups().catch(() => ({ groups: [] })),
@@ -410,6 +459,12 @@ export default function Accounts() {
     setAllGroups(groupsResponse.groups ?? []);
     return {
       accounts: accountsResponse.accounts ?? [],
+      page: accountsResponse.page ?? accountQueryRef.current.page ?? 1,
+      total: accountsResponse.total ?? 0,
+      pageSize: accountsResponse.page_size ?? accountQueryRef.current.page_size ?? 20,
+      totalPages: accountsResponse.total_pages ?? 1,
+      summary: accountsResponse.summary ?? emptySummary,
+      availableTags: accountsResponse.available_tags ?? [],
       apiKeys: apiKeysResponse.keys ?? [],
       opsOverview,
     };
@@ -417,19 +472,41 @@ export default function Accounts() {
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     accounts: AccountRow[];
+    page: number;
+    total: number;
+    pageSize: number;
+    totalPages: number;
+    summary: AccountListSummary;
+    availableTags: string[];
     apiKeys: APIKeyRow[];
     opsOverview: OpsOverviewResponse | null;
   }>({
     initialData: {
       accounts: [],
+      page: 1,
+      total: 0,
+      pageSize: 20,
+      totalPages: 1,
+      summary: emptySummary,
+      availableTags: [],
       apiKeys: [],
       opsOverview: null,
     },
     load: loadAccounts,
   });
   const accounts = data.accounts;
+  const currentPage = data.page;
+  const totalItems = data.total;
+  const pageSizeValue = data.pageSize;
+  const totalPages = data.totalPages;
+  const summary = data.summary;
+  const availableTags = data.availableTags;
   const apiKeys = data.apiKeys;
   const opsOverview = data.opsOverview;
+  const fetchAllAccounts = useCallback(async () => {
+    const response = await api.getAccounts({ all: true });
+    return response.accounts ?? [];
+  }, []);
   const usageReloadAttemptsRef = useRef<Map<number, number>>(new Map());
 
   useEffect(() => {
@@ -441,11 +518,46 @@ export default function Accounts() {
   }, [visibleColumns]);
 
   useEffect(() => {
-    if (groupFilter === null) return;
-    if (!allGroups.some((group) => group.id === groupFilter)) {
-      setGroupFilter(null);
+    if (groupFilter === "all" || groupFilter === "ungrouped") return;
+    if (!allGroups.some((group) => String(group.id) === groupFilter)) {
+      setGroupFilter("all");
     }
   }, [allGroups, groupFilter]);
+
+  useEffect(() => {
+    accountQueryRef.current = accountQuery;
+    if (queryMountedRef.current) {
+      void reloadSilently();
+      return;
+    }
+    queryMountedRef.current = true;
+  }, [accountQuery, reloadSilently]);
+
+  useEffect(() => {
+    if (currentPage !== page) {
+      setPage(currentPage);
+    }
+  }, [currentPage, page]);
+
+  useEffect(() => {
+    if (pageSizeValue !== pageSize) {
+      setPageSize(pageSizeValue);
+    }
+  }, [pageSize, pageSizeValue]);
+
+  useEffect(() => {
+    setSelected(new Set());
+  }, [
+    groupFilter,
+    page,
+    pageSize,
+    planFilter,
+    searchQuery,
+    sortDir,
+    sortKey,
+    statusFilter,
+    tagFilter,
+  ]);
 
   useEffect(() => {
     const needsUsageReload = (account: AccountRow) => {
@@ -506,180 +618,24 @@ export default function Accounts() {
     return () => window.clearTimeout(timer);
   }, [accounts, reloadSilently]);
 
-  const accountSummary = useMemo(() => {
-    const rateLimitedWindowStats = getRateLimitedWindowStats(accounts);
-    // 互斥分类:每个账号只属于 异常 / 限流 / 正常 之一,三者相加等于总数。
-    // 优先级:异常(封禁/错误/禁用) > 限流 > 正常。locked 不影响分类,视为正常状态的一种子标记。
-    const bannedAccounts = accounts.filter(
-      (account) => account.status === "unauthorized",
-    ).length;
-    const errorAccounts = accounts.filter(
-      (account) => account.status === "error",
-    ).length;
-    const disabledAccounts = accounts.filter(
-      (account) => account.enabled === false,
-    ).length;
-    const abnormalAccounts = accounts.filter(
-      (account) =>
-        account.status === "unauthorized" ||
-        account.status === "error" ||
-        account.enabled === false,
-    ).length;
-    const rateLimitedExclusive = accounts.filter(
-      (account) =>
-        account.status !== "unauthorized" &&
-        account.status !== "error" &&
-        account.enabled !== false &&
-        isRateLimitedAccount(account),
-    ).length;
-    const normalAccounts = accounts.length - abnormalAccounts - rateLimitedExclusive;
-    return {
-      totalAccounts: accounts.length,
-      normalAccounts,
-      rateLimitedAccounts: rateLimitedExclusive,
-      rateLimited5hAccounts: rateLimitedWindowStats.fiveHour,
-      rateLimited7dAccounts: rateLimitedWindowStats.sevenDay,
-      abnormalAccounts,
-      bannedAccounts,
-      errorAccounts,
-      disabledAccounts,
-      lockedAccounts: accounts.filter((account) => account.locked).length,
-      subscriptionAccountsToLock: accounts.filter(
-        (account) => isSubscriptionPlan(account.plan_type) && !account.locked,
-      ),
-      healthyAccounts: accounts.filter(
-        (account) => account.health_tier === "healthy",
-      ).length,
-      warmAccounts: accounts.filter((account) => account.health_tier === "warm")
-        .length,
-      riskyAccounts: accounts.filter(
-        (account) => account.health_tier === "risky",
-      ).length,
-    };
-  }, [accounts]);
   const {
-    totalAccounts,
-    normalAccounts,
-    rateLimitedAccounts,
-    rateLimited5hAccounts,
-    rateLimited7dAccounts,
-    abnormalAccounts,
-    bannedAccounts,
-    errorAccounts,
-    disabledAccounts,
-    lockedAccounts,
-    subscriptionAccountsToLock,
-    healthyAccounts,
-    warmAccounts,
-    riskyAccounts,
-  } = accountSummary;
+    total_accounts: totalAccounts,
+    normal_accounts: normalAccounts,
+    rate_limited_accounts: rateLimitedAccounts,
+    rate_limited_5h_accounts: rateLimited5hAccounts,
+    rate_limited_7d_accounts: rateLimited7dAccounts,
+    abnormal_accounts: abnormalAccounts,
+    banned_accounts: bannedAccounts,
+    error_accounts: errorAccounts,
+    disabled_accounts: disabledAccounts,
+    locked_accounts: lockedAccounts,
+    subscription_accounts_to_lock: subscriptionAccountsToLock,
+    healthy_accounts: healthyAccounts,
+    warm_accounts: warmAccounts,
+    risky_accounts: riskyAccounts,
+  } = summary;
 
-  const allTags = useMemo(() => {
-    const tags = new Set<string>();
-    for (const account of accounts) {
-      for (const tag of account.tags ?? []) {
-        tags.add(tag);
-      }
-    }
-    return Array.from(tags).sort();
-  }, [accounts]);
-
-  const filteredAccounts = useMemo(() => {
-    const query = searchQuery.toLowerCase();
-    return accounts.filter((account) => {
-      switch (statusFilter) {
-        case "normal":
-          if (
-            account.status === "unauthorized" ||
-            account.status === "error" ||
-            account.enabled === false ||
-            isRateLimitedAccount(account)
-          )
-            return false;
-          if (account.status !== "active" && account.status !== "ready")
-            return false;
-          break;
-        case "rate_limited":
-          if (
-            account.status === "unauthorized" ||
-            account.status === "error" ||
-            account.enabled === false
-          )
-            return false;
-          if (!isRateLimitedAccount(account)) return false;
-          break;
-        case "abnormal":
-          if (
-            account.status !== "unauthorized" &&
-            account.status !== "error" &&
-            account.enabled !== false
-          )
-            return false;
-          break;
-        case "banned":
-          if (account.status !== "unauthorized") return false;
-          break;
-        case "error":
-          if (account.status !== "error") return false;
-          break;
-        case "disabled":
-          if (account.enabled !== false) return false;
-          break;
-        case "locked":
-          if (!account.locked) return false;
-          break;
-      }
-      if (planFilter !== "all") {
-        const plan = (account.plan_type || "").toLowerCase().trim();
-        if (plan !== planFilter) return false;
-      }
-      if (query) {
-        const email = (account.email || "").toLowerCase();
-        const name = (account.name || "").toLowerCase();
-        if (!email.includes(query) && !name.includes(query)) return false;
-      }
-      if (tagFilter && !(account.tags ?? []).includes(tagFilter)) return false;
-      if (
-        groupFilter !== null &&
-        !(account.group_ids ?? []).includes(groupFilter)
-      )
-        return false;
-      return true;
-    });
-  }, [accounts, groupFilter, planFilter, searchQuery, statusFilter, tagFilter]);
-
-  const sortedAccounts = useMemo(() => {
-    if (!sortKey) return filteredAccounts;
-    return [...filteredAccounts].sort((a, b) => {
-      let diff = 0;
-      if (sortKey === "score") {
-        diff = getDispatchScore(a) - getDispatchScore(b);
-      } else if (sortKey === "requests") {
-        diff =
-          (a.success_requests ?? 0) +
-          (a.error_requests ?? 0) -
-          ((b.success_requests ?? 0) + (b.error_requests ?? 0));
-      } else if (sortKey === "usage") {
-        diff = (a.usage_percent_7d ?? -1) - (b.usage_percent_7d ?? -1);
-      } else if (sortKey === "importTime") {
-        diff =
-          new Date(a.created_at || 0).getTime() -
-          new Date(b.created_at || 0).getTime();
-      }
-      return sortDir === "asc" ? diff : -diff;
-    });
-  }, [filteredAccounts, sortDir, sortKey]);
-
-  const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize));
-  const currentPage = Math.min(page, totalPages);
-  const pagedAccounts = useMemo(
-    () =>
-      sortedAccounts.slice(
-        (currentPage - 1) * pageSize,
-        currentPage * pageSize,
-      ),
-    [currentPage, pageSize, sortedAccounts],
-  );
+  const pagedAccounts = accounts;
   const pagedAccountIds = useMemo(
     () => pagedAccounts.map((account) => account.id),
     [pagedAccounts],
@@ -695,12 +651,6 @@ export default function Accounts() {
   const allPageSelected =
     pagedAccountIds.length > 0 && pageSelectedCount === pagedAccountIds.length;
   const somePageSelected = pageSelectedCount > 0 && !allPageSelected;
-
-  useEffect(() => {
-    if (page > totalPages) {
-      setPage(totalPages);
-    }
-  }, [page, totalPages]);
 
   useEffect(() => {
     if (!accounts.some((account) => account.status === "refreshing")) {
@@ -1474,8 +1424,7 @@ export default function Accounts() {
   };
 
   const handleLockSubscriptionAccounts = async () => {
-    const candidates = subscriptionAccountsToLock;
-    if (candidates.length === 0) {
+    if (subscriptionAccountsToLock === 0) {
       showToast(t("accounts.noSubscriptionAccountsToLock"));
       return;
     }
@@ -1483,12 +1432,24 @@ export default function Accounts() {
     setBatchLoading(true);
     setLockingSubscriptionAccounts(true);
     try {
+      const candidates = (await fetchAllAccounts()).filter(
+        (account) => isSubscriptionPlan(account.plan_type) && !account.locked,
+      );
+      if (candidates.length === 0) {
+        showToast(t("accounts.noSubscriptionAccountsToLock"));
+        return;
+      }
       const { success, fail } = await runAccountBatch(
         candidates.map((account) => account.id),
         (id) => api.toggleAccountLock(id, true),
       );
       showToast(t("accounts.lockSubscriptionAccountsDone", { success, fail }));
       void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.lockFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
     } finally {
       setBatchLoading(false);
       setLockingSubscriptionAccounts(false);
@@ -1535,12 +1496,19 @@ export default function Accounts() {
     }
   };
 
-  const handleBatchRefresh = async (ids?: number[]) => {
-    const targetIds = ids ?? Array.from(selected);
-    if (targetIds.length === 0) return;
+  const handleBatchRefresh = async (
+    ids?: number[],
+    scope: "selected" | "all" = "selected",
+  ) => {
     setBatchLoading(true);
     setBatchRefreshing(true);
     try {
+      const targetIds =
+        ids ??
+        (scope === "selected" && selected.size > 0
+          ? Array.from(selected)
+          : (await fetchAllAccounts()).map((account) => account.id));
+      if (targetIds.length === 0) return;
       const { success, fail } = await runAccountBatch(
         targetIds,
         api.refreshAccount,
@@ -1548,6 +1516,11 @@ export default function Accounts() {
       );
       showToast(t("accounts.batchRefreshDone", { success, fail }));
       void reload();
+    } catch (error) {
+      showToast(
+        `${t("accounts.batchRefresh")}: ${getErrorMessage(error)}`,
+        "error",
+      );
     } finally {
       setBatchLoading(false);
       setBatchRefreshing(false);
@@ -1672,11 +1645,19 @@ export default function Accounts() {
     }
   };
 
-  const handleBatchTest = async (ids?: number[]) => {
-    if (ids && ids.length === 0) return;
+  const handleBatchTest = async (
+    ids?: number[],
+    scope: "selected" | "all" = "selected",
+  ) => {
     setBatchTesting(true);
     try {
-      const result = await api.batchTestAccounts(ids);
+      const targetIds =
+        ids ??
+        (scope === "selected" && selected.size > 0
+          ? Array.from(selected)
+          : (await fetchAllAccounts()).map((account) => account.id));
+      if (targetIds.length === 0) return;
+      const result = await api.batchTestAccounts(targetIds);
       showToast(
         t("accounts.batchTestDone", {
           success: result.success,
@@ -1996,13 +1977,46 @@ export default function Accounts() {
       showToast(t("accounts.groupDeleted"));
       setEditGroupIds((current) => current.filter((id) => id !== group.id));
       setBatchGroupIds((current) => current.filter((id) => id !== group.id));
-      if (groupFilter === group.id) setGroupFilter(null);
+      if (groupFilter === String(group.id)) setGroupFilter("all");
       if (groupDraft.id === group.id) resetGroupDraft();
       await Promise.all([reload(), reloadGroups()]);
     } catch (error) {
       showToast(getErrorMessage(error), "error");
     } finally {
       setGroupSubmitting(false);
+    }
+  };
+
+  const handleAssignUngroupedAccounts = async (group: AccountGroup) => {
+    const confirmed = await confirm({
+      title: t("accounts.assignUngrouped"),
+      description: t("accounts.assignUngroupedConfirm", {
+        group: group.name,
+      }),
+      confirmText: t("accounts.assignUngrouped"),
+      tone: "warning",
+    });
+    if (!confirmed) return;
+
+    setAssigningUngroupedGroupId(group.id);
+    try {
+      const result = await api.assignUngroupedAccountsToGroup(group.id);
+      showToast(
+        t("accounts.assignUngroupedDone", {
+          count: result.assigned ?? 0,
+          group: group.name,
+        }),
+      );
+      await reload();
+    } catch (error) {
+      showToast(
+        t("accounts.assignUngroupedFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setAssigningUngroupedGroupId(null);
     }
   };
 
@@ -2067,11 +2081,8 @@ export default function Accounts() {
                         />
                       ),
                       disabled:
-                        batchLoading || batchTesting || accounts.length === 0,
-                      onSelect: () =>
-                        void handleBatchRefresh(
-                          accounts.map((account) => account.id),
-                        ),
+                        batchLoading || batchTesting || totalAccounts === 0,
+                      onSelect: () => void handleBatchRefresh(undefined, "all"),
                     },
                     {
                       key: "test-connection",
@@ -2080,8 +2091,8 @@ export default function Accounts() {
                         : t("accounts.testConnection"),
                       icon: <FlaskConical className="size-3.5" />,
                       disabled:
-                        batchLoading || batchTesting || accounts.length === 0,
-                      onSelect: () => void handleBatchTest(),
+                        batchLoading || batchTesting || totalAccounts === 0,
+                      onSelect: () => void handleBatchTest(undefined, "all"),
                     },
                     {
                       key: "lock-subscription",
@@ -2093,9 +2104,9 @@ export default function Accounts() {
                         batchLoading ||
                         batchTesting ||
                         lockingSubscriptionAccounts ||
-                        accounts.length === 0,
+                        totalAccounts === 0,
                       title: t("accounts.lockSubscriptionAccountsHint", {
-                        count: subscriptionAccountsToLock.length,
+                        count: subscriptionAccountsToLock,
                       }),
                       onSelect: () => void handleLockSubscriptionAccounts(),
                     },
@@ -2386,19 +2397,20 @@ export default function Accounts() {
               }}
               options={[
                 { value: "all", label: t("accounts.tagsFilter") },
-                ...allTags.map((tag) => ({ value: tag, label: tag })),
+                ...availableTags.map((tag) => ({ value: tag, label: tag })),
               ]}
             />
             <Select
               className="w-36 shrink-0"
               compact
-              value={groupFilter === null ? "all" : String(groupFilter)}
+              value={groupFilter}
               onValueChange={(value) => {
-                setGroupFilter(value === "all" ? null : Number(value));
+                setGroupFilter(value);
                 setPage(1);
               }}
               options={[
                 { value: "all", label: t("accounts.groupsFilter") },
+                { value: "ungrouped", label: t("accounts.filterUngrouped") },
                 ...allGroups.map((group) => ({
                   value: String(group.id),
                   label: group.name,
@@ -2435,6 +2447,7 @@ export default function Accounts() {
                   tags: t("accounts.tagsLabel"),
                   groups: t("accounts.groupsLabel"),
                   status: t("accounts.status"),
+                  concurrency: t("accounts.concurrency"),
                   requests: t("accounts.requests"),
                   usage: t("accounts.usage"),
                   importTime: t("accounts.importTime"),
@@ -2619,6 +2632,11 @@ export default function Accounts() {
                               : ""}
                           </TableHead>
                         )}
+                        {visibleColumns.concurrency && (
+                          <TableHead className="text-[13px] font-semibold">
+                            {t("accounts.concurrency")}
+                          </TableHead>
+                        )}
                         {visibleColumns.requests && (
                           <TableHead
                             className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
@@ -2689,8 +2707,26 @@ export default function Accounts() {
                           </TableHead>
                         )}
                         {visibleColumns.updatedAt && (
-                          <TableHead className="text-[13px] font-semibold">
-                            {t("accounts.updatedAt")}
+                          <TableHead
+                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
+                            onClick={() => {
+                              if (sortKey === "updatedAt") {
+                                setSortDir((d) =>
+                                  d === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("updatedAt");
+                                setSortDir("desc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.updatedAt")}{" "}
+                            {sortKey === "updatedAt"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.actions && (
@@ -2721,7 +2757,7 @@ export default function Accounts() {
                                 className="text-[14px] font-mono text-muted-foreground"
                                 title={`ID ${account.id}`}
                               >
-                                {(currentPage - 1) * pageSize + index + 1}
+                                {(currentPage - 1) * pageSizeValue + index + 1}
                               </TableCell>
                             )}
                             {visibleColumns.email && (
@@ -2825,14 +2861,26 @@ export default function Accounts() {
                                         "-",
                                     })}
                                   </div>
-                                  {(account.active_requests ?? 0) > 0 && (
-                                    <div className="text-[11px] font-medium text-blue-600 dark:text-blue-400">
-                                      {t("accounts.activeRequests")}: {account.active_requests}
-                                      {(account.dynamic_concurrency_limit ?? 0) > 0
-                                        ? ` / ${account.dynamic_concurrency_limit}`
-                                        : ""}
-                                    </div>
-                                  )}
+                                </div>
+                              </TableCell>
+                            )}
+                            {visibleColumns.concurrency && (
+                              <TableCell>
+                                <div
+                                  className={`text-[13px] font-medium ${
+                                    (account.active_requests ?? 0) > 0
+                                      ? "text-blue-600 dark:text-blue-400"
+                                      : "text-muted-foreground"
+                                  }`}
+                                >
+                                  <div>
+                                    {(account.active_requests ?? 0) > 0
+                                      ? account.active_requests
+                                      : 0}
+                                    {(account.dynamic_concurrency_limit ?? 0) > 0
+                                      ? ` / ${account.dynamic_concurrency_limit}`
+                                      : ""}
+                                  </div>
                                 </div>
                               </TableCell>
                             )}
@@ -3024,8 +3072,8 @@ export default function Accounts() {
                   page={currentPage}
                   totalPages={totalPages}
                   onPageChange={setPage}
-                  totalItems={sortedAccounts.length}
-                  pageSize={pageSize}
+                  totalItems={totalItems}
+                  pageSize={pageSizeValue}
                   pageSizeOptions={pageSizeOptions}
                   onPageSizeChange={(nextPageSize) => {
                     setPageSize(nextPageSize);
@@ -4413,6 +4461,24 @@ export default function Accounts() {
                                 t("accounts.groupNoDescription")}
                             </div>
                           </div>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="shrink-0"
+                            onClick={() =>
+                              void handleAssignUngroupedAccounts(group)
+                            }
+                            disabled={
+                              groupSubmitting ||
+                              assigningUngroupedGroupId === group.id
+                            }
+                          >
+                            <FolderOpen className="size-3.5" />
+                            {assigningUngroupedGroupId === group.id
+                              ? t("common.loading")
+                              : t("accounts.assignUngrouped")}
+                          </Button>
                           <Button
                             type="button"
                             variant="ghost"
