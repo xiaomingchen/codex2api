@@ -450,9 +450,10 @@ export default function Accounts() {
   const queryMountedRef = useRef(false);
 
   const loadAccounts = useCallback(async () => {
+    const requestedQuery = accountQueryRef.current;
     const [accountsResponse, apiKeysResponse, opsOverview, groupsResponse] =
       await Promise.all([
-        api.getAccounts(accountQueryRef.current),
+        api.getAccounts(requestedQuery),
         api.getAPIKeys(),
         api.getOpsOverview().catch((): OpsOverviewResponse | null => null),
         api.listAccountGroups().catch(() => ({ groups: [] })),
@@ -460,9 +461,11 @@ export default function Accounts() {
     setAllGroups(groupsResponse.groups ?? []);
     return {
       accounts: accountsResponse.accounts ?? [],
-      page: accountsResponse.page ?? accountQueryRef.current.page ?? 1,
+      requestedPage: requestedQuery.page ?? 1,
+      requestedPageSize: requestedQuery.page_size ?? 20,
+      page: accountsResponse.page ?? requestedQuery.page ?? 1,
       total: accountsResponse.total ?? 0,
-      pageSize: accountsResponse.page_size ?? accountQueryRef.current.page_size ?? 20,
+      pageSize: accountsResponse.page_size ?? requestedQuery.page_size ?? 20,
       totalPages: accountsResponse.total_pages ?? 1,
       summary: accountsResponse.summary ?? emptySummary,
       availableTags: accountsResponse.available_tags ?? [],
@@ -473,6 +476,8 @@ export default function Accounts() {
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     accounts: AccountRow[];
+    requestedPage: number;
+    requestedPageSize: number;
     page: number;
     total: number;
     pageSize: number;
@@ -484,6 +489,8 @@ export default function Accounts() {
   }>({
     initialData: {
       accounts: [],
+      requestedPage: 1,
+      requestedPageSize: 20,
       page: 1,
       total: 0,
       pageSize: 20,
@@ -497,6 +504,8 @@ export default function Accounts() {
   });
   const accounts = data.accounts;
   const currentPage = data.page;
+  const requestedPage = data.requestedPage;
+  const requestedPageSize = data.requestedPageSize;
   const totalItems = data.total;
   const pageSizeValue = data.pageSize;
   const totalPages = data.totalPages;
@@ -535,16 +544,22 @@ export default function Accounts() {
   }, [accountQuery, reloadSilently]);
 
   useEffect(() => {
+    if (requestedPage !== accountQueryRef.current.page) {
+      return;
+    }
     if (currentPage !== page) {
       setPage(currentPage);
     }
-  }, [currentPage, page]);
+  }, [currentPage, page, requestedPage]);
 
   useEffect(() => {
+    if (requestedPageSize !== accountQueryRef.current.page_size) {
+      return;
+    }
     if (pageSizeValue !== pageSize) {
       setPageSize(pageSizeValue);
     }
-  }, [pageSize, pageSizeValue]);
+  }, [pageSize, pageSizeValue, requestedPageSize]);
 
   useEffect(() => {
     setSelected(new Set());
