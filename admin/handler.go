@@ -213,6 +213,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
 	api.GET("/accounts/:id/auth-json", h.GetAccountAuthJSON)
+	api.PATCH("/accounts/:id/credit", h.UpdateAccountCredit)
 	api.POST("/accounts/batch-test", h.BatchTest)
 	api.POST("/accounts/batch-reset-status", h.BatchResetStatus)
 	api.POST("/accounts/clean-banned", h.CleanBanned)
@@ -254,6 +255,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/image-prompts/:id", h.UpdateImagePromptTemplate)
 	api.DELETE("/image-prompts/:id", h.DeleteImagePromptTemplate)
 	api.POST("/images/jobs", h.CreateImageGenerationJob)
+	api.POST("/images/edit-jobs", h.CreateImageEditJob)
 	api.GET("/images/jobs", h.ListImageGenerationJobs)
 	api.GET("/images/jobs/:id", h.GetImageGenerationJob)
 	api.DELETE("/images/jobs/:id", h.DeleteImageGenerationJob)
@@ -393,6 +395,8 @@ type accountResponse struct {
 	Status                   string                     `json:"status"`
 	ErrorMessage             string                     `json:"error_message,omitempty"`
 	ATOnly                   bool                       `json:"at_only"`
+	CreditEnabled            bool                       `json:"credit_enabled"`
+	CreditSkipUsageWindow    bool                       `json:"credit_skip_usage_window"`
 	AccountType              string                     `json:"account_type,omitempty"`
 	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
 	BaseURL                  string                     `json:"base_url,omitempty"`
@@ -421,6 +425,8 @@ type accountResponse struct {
 	Usage7dDetail            *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                string                     `json:"reset_5h_at,omitempty"`
 	Reset7dAt                string                     `json:"reset_7d_at,omitempty"`
+	Billed5h                 *float64                   `json:"billed_5h"`
+	Billed7d                 *float64                   `json:"billed_7d"`
 	ScoreBreakdown           schedulerBreakdownResponse `json:"scheduler_breakdown"`
 	LastUnauthorizedAt       string                     `json:"last_unauthorized_at,omitempty"`
 	LastRateLimitedAt        string                     `json:"last_rate_limited_at,omitempty"`
@@ -524,6 +530,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Status:                   row.Status,
 			ErrorMessage:             row.ErrorMessage,
 			ATOnly:                   !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			CreditEnabled:            row.CreditEnabled,
+			CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
 			AccountType:              row.Type,
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
 			BaseURL:                  baseURL,
@@ -648,6 +656,26 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		accounts = append(accounts, resp)
 	}
 
+	// 批量查询各账号 5h / 7d 窗口内累计 account_billed
+	for i := range accounts {
+		acc, ok := accountMap[accounts[i].ID]
+		if !ok {
+			continue
+		}
+		if t := acc.GetReset5hAt(); !t.IsZero() {
+			billed, err := h.db.GetAccountBilledSince(ctx, accounts[i].ID, t.Add(-5*time.Hour))
+			if err == nil {
+				accounts[i].Billed5h = &billed
+			}
+		}
+		if t := acc.GetReset7dAt(); !t.IsZero() {
+			billed, err := h.db.GetAccountBilledSince(ctx, accounts[i].ID, t.AddDate(0, 0, -7))
+			if err == nil {
+				accounts[i].Billed7d = &billed
+			}
+		}
+	}
+
 	summary := buildAccountListSummary(accounts)
 	availableTags := collectAccountTags(accounts)
 	filteredAccounts := filterAccountResponses(accounts, query)
@@ -675,6 +703,45 @@ type updateAccountSchedulerReq struct {
 }
 
 // UpdateAccountScheduler 更新账号调度配置。
+// UpdateAccountCredit 更新账号信用设置
+func (h *Handler) UpdateAccountCredit(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req struct {
+		CreditEnabled         *bool `json:"credit_enabled"`
+		CreditSkipUsageWindow *bool `json:"credit_skip_usage_window"`
+	}
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	acc := h.store.FindByID(id)
+	if acc == nil {
+		writeError(c, http.StatusNotFound, "账号不存在")
+		return
+	}
+
+	// 传入 *bool：nil = 不修改该字段
+	if err := h.store.UpdateAccountCredit(id, req.CreditEnabled, req.CreditSkipUsageWindow); err != nil {
+		writeError(c, http.StatusInternalServerError, "更新信用设置失败: "+err.Error())
+		return
+	}
+
+	acc = h.store.FindByID(id)
+	if acc != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "信用设置已更新", "credit_enabled": acc.CreditEnabled, "credit_skip_usage_window": acc.CreditSkipUsageWindow})
+	} else {
+		c.JSON(http.StatusOK, gin.H{"message": "信用设置已更新"})
+	}
+}
+
 func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -3553,6 +3620,7 @@ type settingsResponse struct {
 	AutoCleanExpired                 bool   `json:"auto_clean_expired"`
 	ProxyPoolEnabled                 bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled             bool   `json:"fast_scheduler_enabled"`
+	SchedulerMode                    string `json:"scheduler_mode"`
 	MaxRetries                       int    `json:"max_retries"`
 	MaxRateLimitRetries              int    `json:"max_rate_limit_retries"`
 	AllowRemoteMigration             bool   `json:"allow_remote_migration"`
@@ -3611,6 +3679,7 @@ type updateSettingsReq struct {
 	AutoCleanExpired                 *bool   `json:"auto_clean_expired"`
 	ProxyPoolEnabled                 *bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled             *bool   `json:"fast_scheduler_enabled"`
+	SchedulerMode                    *string `json:"scheduler_mode"`
 	MaxRetries                       *int    `json:"max_retries"`
 	MaxRateLimitRetries              *int    `json:"max_rate_limit_retries"`
 	AllowRemoteMigration             *bool   `json:"allow_remote_migration"`
@@ -3751,6 +3820,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		SchedulerMode:                    h.store.GetSchedulerMode(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
@@ -3981,6 +4051,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.FastSchedulerEnabled != nil {
 		h.store.SetFastSchedulerEnabled(*req.FastSchedulerEnabled)
 		log.Printf("设置已更新: fast_scheduler_enabled = %t", *req.FastSchedulerEnabled)
+	}
+
+	if req.SchedulerMode != nil {
+		h.store.SetSchedulerMode(*req.SchedulerMode)
+		log.Printf("设置已更新: scheduler_mode = %s", *req.SchedulerMode)
 	}
 
 	if req.MaxRetries != nil {
@@ -4224,6 +4299,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		SchedulerMode:                    h.store.GetSchedulerMode(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && hasAdminSecret,
@@ -4287,6 +4363,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		SchedulerMode:                    h.store.GetSchedulerMode(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
