@@ -6032,14 +6032,6 @@ function formatCompactUsageNumber(value?: number): string {
   return String(n);
 }
 
-function formatCompactCost(value?: number): string {
-  const n = Number(value || 0);
-  if (n <= 0) return "";
-  if (n >= 100) return `${n.toLocaleString(undefined, { maximumFractionDigits: 1 })}`;
-  if (n >= 1) return `${n.toFixed(2)}`;
-  return `${n.toFixed(4)}`;
-}
-
 function hasUsageWindowDetail(detail?: AccountRow["usage_5h_detail"]): boolean {
   return Boolean(
     detail && ((detail.requests ?? 0) > 0 || (detail.tokens ?? 0) > 0),
@@ -6070,12 +6062,6 @@ function UsageBar({
   const detailText = hasUsageWindowDetail(detail)
     ? `${formatCompactUsageNumber(detail?.requests)} ${t("accounts.usageReqUnit")} / ${formatCompactUsageNumber(detail?.tokens)} ${t("accounts.usageTokUnit")}`
     : "";
-  const costText =
-    typeof detail?.user_billed === "number" && detail.user_billed > 0
-      ? formatCompactCost(detail.user_billed)
-      : typeof detail?.account_billed === "number" && detail.account_billed > 0
-        ? formatCompactCost(detail.account_billed)
-        : "";
   return (
     <div>
       <div className="flex items-center gap-1.5">
@@ -6092,14 +6078,9 @@ function UsageBar({
           {pct.toFixed(1)}%
         </span>
       </div>
-      {(detailText || costText) && (
+      {detailText && (
         <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">
           {detailText}
-          {costText && (
-            <span className="font-semibold text-emerald-600 dark:text-emerald-400 ml-1.5">
-              {costText}
-            </span>
-          )}
         </div>
       )}
       {resetText && (
@@ -6121,13 +6102,6 @@ function UsageWindowStat({
   const { t } = useTranslation();
   if (!detail || !hasUsageWindowDetail(detail)) return null;
 
-  const accountBilledText =
-    typeof detail.account_billed === "number"
-      ? detail.account_billed.toFixed(4)
-      : "";
-  const userBilledText =
-    typeof detail.user_billed === "number" ? detail.user_billed.toFixed(4) : "";
-
   return (
     <div className="flex flex-col gap-0.5">
       <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
@@ -6139,20 +6113,6 @@ function UsageWindowStat({
           {t("accounts.usageTokUnit")}
         </span>
       </div>
-      {(accountBilledText || userBilledText) && (
-        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-6">
-          {accountBilledText && (
-            <span>
-              {t("accounts.accountBilledLabel")}: ${accountBilledText}
-            </span>
-          )}
-          {userBilledText && (
-            <span>
-              {t("accounts.userBilledLabel")}: ${userBilledText}
-            </span>
-          )}
-        </div>
-      )}
     </div>
   );
 }
