@@ -107,7 +107,7 @@ export interface AccountListQuery {
   q?: string
   tag?: string
   group_id?: string
-  sort_key?: 'score' | 'requests' | 'usage' | 'importTime' | 'updatedAt'
+  sort_key?: 'score' | 'requests' | 'usage' | 'importTime' | 'updatedAt' | 'cooldownUntil'
   sort_dir?: 'asc' | 'desc'
   all?: boolean
 }

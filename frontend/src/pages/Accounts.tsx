@@ -106,6 +106,13 @@ const ACCOUNT_GROUP_COLORS = [
   "#64748b",
 ] as const;
 type AccountTableColumn = (typeof ACCOUNT_TABLE_COLUMNS)[number];
+type AccountSortKey =
+  | "score"
+  | "requests"
+  | "usage"
+  | "importTime"
+  | "updatedAt"
+  | "cooldownUntil";
 type AccountGroupDraft = {
   id: number | null;
   name: string;
@@ -266,9 +273,7 @@ export default function Accounts() {
   const [planFilter, setPlanFilter] = useState<
     "all" | "pro" | "prolite" | "plus" | "team" | "free"
   >("all");
-  const [sortKey, setSortKey] = useState<
-    "score" | "requests" | "usage" | "importTime" | "updatedAt" | null
-  >("score");
+  const [sortKey, setSortKey] = useState<AccountSortKey | null>("score");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: "",
@@ -2379,6 +2384,30 @@ export default function Accounts() {
                 }}
               />
             </div>
+            <Button
+              type="button"
+              variant={sortKey === "cooldownUntil" ? "secondary" : "outline"}
+              size="sm"
+              className="shrink-0"
+              onClick={() => {
+                if (sortKey === "cooldownUntil") {
+                  setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+                } else {
+                  setSortKey("cooldownUntil");
+                  setSortDir("asc");
+                }
+                setPage(1);
+              }}
+              title={t("accounts.cooldown")}
+            >
+              <Timer className="size-3.5" />
+              {t("accounts.cooldown")}
+              {sortKey === "cooldownUntil"
+                ? sortDir === "desc"
+                  ? " ↓"
+                  : " ↑"
+                : ""}
+            </Button>
             <div className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5">
               {(["all", "pro", "prolite", "plus", "team", "free"] as const).map(
                 (key) => (

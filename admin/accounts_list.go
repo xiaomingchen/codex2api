@@ -63,7 +63,7 @@ func parseAccountListQuery(c *gin.Context) (accountListQuery, bool) {
 	switch query.SortKey {
 	case "", "score":
 		query.SortKey = "score"
-	case "requests", "usage", "importTime", "updatedAt":
+	case "requests", "usage", "importTime", "updatedAt", "cooldownUntil":
 	default:
 		query.SortKey = "score"
 	}
@@ -180,6 +180,31 @@ func sortAccountResponses(accounts []accountResponse, sortKey, sortDir string) {
 		left := accounts[i]
 		right := accounts[j]
 
+		if sortKey == "cooldownUntil" {
+			leftHasCooldown := strings.TrimSpace(left.CooldownUntil) != ""
+			rightHasCooldown := strings.TrimSpace(right.CooldownUntil) != ""
+			switch {
+			case leftHasCooldown && !rightHasCooldown:
+				return true
+			case !leftHasCooldown && rightHasCooldown:
+				return false
+			case leftHasCooldown && rightHasCooldown:
+				cmp := compareRFC3339(left.CooldownUntil, right.CooldownUntil)
+				if cmp != 0 {
+					if desc {
+						return cmp > 0
+					}
+					return cmp < 0
+				}
+			}
+			if left.ID == right.ID {
+				return false
+			}
+			if desc {
+				return left.ID > right.ID
+			}
+			return left.ID < right.ID
+		}
 		var diff float64
 		switch sortKey {
 		case "requests":

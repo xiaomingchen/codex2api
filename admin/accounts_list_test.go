@@ -51,6 +51,25 @@ func TestParseAccountListQuerySupportsUpdatedAtSort(t *testing.T) {
 	}
 }
 
+func TestParseAccountListQuerySupportsCooldownUntilSort(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(
+		"GET",
+		"/api/admin/accounts?sort_key=cooldownUntil&sort_dir=asc",
+		nil,
+	)
+
+	query, ok := parseAccountListQuery(ctx)
+	if !ok {
+		t.Fatal("parseAccountListQuery returned false")
+	}
+	if query.SortKey != "cooldownUntil" || query.SortDir != "asc" {
+		t.Fatalf("unexpected sort query: %#v", query)
+	}
+}
+
 func TestAccountListHelpersFilterAndPaginate(t *testing.T) {
 	accounts := []accountResponse{
 		{ID: 1, Name: "Alpha", Email: "alpha@example.com", Status: "active", PlanType: "pro", Tags: []string{"ops"}, HealthTier: "healthy", Enabled: true, DispatchScore: 30},
@@ -106,6 +125,25 @@ func TestSortAccountResponsesByUpdatedAt(t *testing.T) {
 	sortAccountResponses(accounts, "updatedAt", "desc")
 	if accounts[0].ID != 2 || accounts[1].ID != 1 {
 		t.Fatalf("descending updatedAt sort failed: %#v", accounts)
+	}
+}
+
+func TestSortAccountResponsesByCooldownUntil(t *testing.T) {
+	accounts := []accountResponse{
+		{ID: 1, CooldownUntil: "2024-02-02T00:00:00Z"},
+		{ID: 2, CooldownUntil: ""},
+		{ID: 3, CooldownUntil: "2024-01-02T00:00:00Z"},
+		{ID: 4, CooldownUntil: ""},
+	}
+
+	sortAccountResponses(accounts, "cooldownUntil", "asc")
+	if accounts[0].ID != 3 || accounts[1].ID != 1 || accounts[2].ID != 2 || accounts[3].ID != 4 {
+		t.Fatalf("ascending cooldownUntil sort failed: %#v", accounts)
+	}
+
+	sortAccountResponses(accounts, "cooldownUntil", "desc")
+	if accounts[0].ID != 1 || accounts[1].ID != 3 || accounts[2].ID != 4 || accounts[3].ID != 2 {
+		t.Fatalf("descending cooldownUntil sort failed: %#v", accounts)
 	}
 }
 
