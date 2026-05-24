@@ -355,6 +355,7 @@ export interface SystemSettings {
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   scheduler_mode: string
+  affinity_mode?: string
   max_retries: number
   max_rate_limit_retries: number
   allow_remote_migration: boolean
@@ -672,6 +673,17 @@ export interface AccountUsageSummaryRow {
   account_billed: number
 }
 
+export interface APIKeyLimits {
+  model_allow?: string[]
+  model_deny?: string[]
+  rpm?: number
+  rpd?: number
+  cost_limit_5h?: number
+  cost_limit_7d?: number
+  token_limit_5h?: number
+  token_limit_7d?: number
+}
+
 export interface APIKeyRow {
   id: number
   name: string
@@ -682,6 +694,7 @@ export interface APIKeyRow {
   expires_at?: ISODateString | null
   status?: 'active' | 'expired' | 'quota_exhausted'
   allowed_group_ids?: number[]
+  limits?: APIKeyLimits
   created_at: ISODateString
 }
 
@@ -695,6 +708,7 @@ export interface CreateAPIKeyRequest {
   expires_at?: string
   expires_in_days?: number
   allowed_group_ids?: number[]
+  limits?: APIKeyLimits
 }
 
 export interface UpdateAPIKeyRequest {
@@ -704,6 +718,7 @@ export interface UpdateAPIKeyRequest {
   expires_at?: string | null
   expires_in_days?: number
   allowed_group_ids?: number[]
+  limits?: APIKeyLimits
 }
 
 export interface CreateAPIKeyResponse {

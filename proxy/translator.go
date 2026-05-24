@@ -87,10 +87,15 @@ type streamChoice struct {
 	FinishReason *string      `json:"finish_reason"`
 }
 
-// streamDelta 流式块中的增量内容
+// streamDelta 流式块中的增量内容。
+//
+// reasoning 字段同时输出两种命名,兼容不同客户端:
+//   - reasoning:  OpenAI 官方 o1/GPT-5 风格(Cherry Studio 等默认走这个)
+//   - reasoning_content: DeepSeek / OpenRouter / new-api 等克隆站点风格
 type streamDelta struct {
 	Role             string          `json:"role,omitempty"`
 	Content          *string         `json:"content,omitempty"`
+	Reasoning        *string         `json:"reasoning,omitempty"`
 	ReasoningContent *string         `json:"reasoning_content,omitempty"`
 	ToolCalls        []toolCallDelta `json:"tool_calls,omitempty"`
 }
@@ -126,11 +131,13 @@ type compactChoice struct {
 	FinishReason string         `json:"finish_reason"`
 }
 
-// compactMessage 非流式响应中的消息
+// compactMessage 非流式响应中的消息。reasoning / reasoning_content 同时输出兼容多端。
 type compactMessage struct {
-	Role      string               `json:"role"`
-	Content   *string              `json:"content"`
-	ToolCalls []compactToolCallOut `json:"tool_calls,omitempty"`
+	Role             string               `json:"role"`
+	Content          *string              `json:"content"`
+	Reasoning        *string              `json:"reasoning,omitempty"`
+	ReasoningContent *string              `json:"reasoning_content,omitempty"`
+	ToolCalls        []compactToolCallOut `json:"tool_calls,omitempty"`
 }
 
 // compactToolCallOut 非流式响应中的工具调用
@@ -1147,9 +1154,16 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	normalizeResponsesInputMessageContent(out)
 	normalizeResponsesInputItemIDs(out)
 
-	// 2. reasoning effort
+	// 2. reasoning effort + summary
+	// 显式向 Codex 请求 summary,否则上游不会发 response.reasoning_summary_text.delta,
+	// chat/completions 客户端就拿不到思考内容(issue #156)。
 	if effort := normalizeReasoningEffort(req.ReasoningEffort); effort != "" {
-		out["reasoning"] = map[string]any{"effort": effort}
+		out["reasoning"] = map[string]any{
+			"effort":  effort,
+			"summary": "auto",
+		}
+	} else {
+		out["reasoning"] = map[string]any{"summary": "auto"}
 	}
 
 	// 3. service tier（兼容客户端字段；只有 fast/priority 会显式传给 Codex 上游）
@@ -2235,13 +2249,17 @@ func newContentChunk(id, model string, created int64, content string) []byte {
 	return b
 }
 
-// newReasoningChunk 构建推理内容流式块
+// newReasoningChunk 构建推理内容流式块。
+// 同时填入 reasoning 与 reasoning_content,兼容 OpenAI/DeepSeek 两套客户端风格。
 func newReasoningChunk(id, model string, created int64, reasoning string) []byte {
 	chunk := openAIStreamChunk{
 		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 		Choices: []streamChoice{{
 			Index: 0,
-			Delta: &streamDelta{ReasoningContent: &reasoning},
+			Delta: &streamDelta{
+				Reasoning:        &reasoning,
+				ReasoningContent: &reasoning,
+			},
 		}},
 	}
 	b, _ := json.Marshal(chunk)
@@ -2458,17 +2476,35 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 
 // TranslateCompactResponse 将 Codex 非流式响应转换为 OpenAI 格式
 func TranslateCompactResponse(responseData []byte, model string, id string) []byte {
-	var outputText string
+	var outputText, reasoningText string
 	output := gjson.GetBytes(responseData, "output")
 	if output.IsArray() {
 		output.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("type").String() == "message" {
+			switch item.Get("type").String() {
+			case "message":
 				content := item.Get("content")
 				if content.IsArray() {
 					content.ForEach(func(_, part gjson.Result) bool {
 						if part.Get("type").String() == "output_text" {
 							outputText += part.Get("text").String()
 						}
+						return true
+					})
+				}
+			case "reasoning":
+				// Codex 在 response.output 里把思考过程作为 reasoning item,
+				// content/summary 数组下每个元素是 {type, text} 形式。
+				summary := item.Get("summary")
+				if summary.IsArray() {
+					summary.ForEach(func(_, part gjson.Result) bool {
+						reasoningText += part.Get("text").String()
+						return true
+					})
+				}
+				content := item.Get("content")
+				if content.IsArray() {
+					content.ForEach(func(_, part gjson.Result) bool {
+						reasoningText += part.Get("text").String()
 						return true
 					})
 				}
@@ -2479,16 +2515,23 @@ func TranslateCompactResponse(responseData []byte, model string, id string) []by
 
 	usage := extractUsage(responseData)
 
+	msg := compactMessage{
+		Role:    "assistant",
+		Content: &outputText,
+	}
+	if reasoningText != "" {
+		r := reasoningText
+		msg.Reasoning = &r
+		msg.ReasoningContent = &r
+	}
+
 	resp := openAICompactResponse{
 		ID:     id,
 		Object: "chat.completion",
 		Model:  model,
 		Choices: []compactChoice{{
-			Index: 0,
-			Message: compactMessage{
-				Role:    "assistant",
-				Content: &outputText,
-			},
+			Index:        0,
+			Message:      msg,
 			FinishReason: "stop",
 		}},
 		Usage: usage,
@@ -2499,11 +2542,17 @@ func TranslateCompactResponse(responseData []byte, model string, id string) []by
 
 // BuildCompactResponse 构建非流式完整响应（供 handler.go 调用，替代内联 sjson）
 // 当有 toolCalls 且 content 为空时，content 输出为 JSON null
-func BuildCompactResponse(id, model string, created int64, content string, toolCalls []ToolCallResult, usage *UsageInfo) []byte {
+// reasoning 为思考过程拼接文本,空字符串时 reasoning / reasoning_content 字段被省略。
+func BuildCompactResponse(id, model string, created int64, content, reasoning string, toolCalls []ToolCallResult, usage *UsageInfo) []byte {
 	finishReason := "stop"
 	msg := compactMessage{
 		Role:    "assistant",
 		Content: &content,
+	}
+	if reasoning != "" {
+		r := reasoning
+		msg.Reasoning = &r
+		msg.ReasoningContent = &r
 	}
 
 	if len(toolCalls) > 0 {

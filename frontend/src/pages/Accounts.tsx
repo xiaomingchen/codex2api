@@ -9,6 +9,10 @@ import StatusBadge from "../components/StatusBadge";
 import ToastNotice from "../components/ToastNotice";
 import { useDataLoader, type LoadOptions } from "../hooks/useDataLoader";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
+import {
+  DEFAULT_PAGE_SIZE_OPTIONS,
+  usePersistedPageSize,
+} from "../hooks/usePersistedPageSize";
 import { useToast } from "../hooks/useToast";
 import type {
   AccountRow,
@@ -59,6 +63,7 @@ import {
   Search,
   Fingerprint,
   FolderOpen,
+  Cloud,
   Lock,
   Unlock,
   RotateCcw,
@@ -75,6 +80,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
+import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import ChipInput from "../components/ChipInput";
@@ -257,10 +263,14 @@ async function runAccountBatch(
 
 export default function Accounts() {
   const { t } = useTranslation();
-  const pageSizeOptions = [10, 20, 50, 100];
+  const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
   const [showAdd, setShowAdd] = useState(false);
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(20);
+  const [pageSize, setPageSize] = usePersistedPageSize(
+    "accounts",
+    20,
+    pageSizeOptions,
+  );
   const [statusFilter, setStatusFilter] = useState<
     | "all"
     | "normal"
@@ -328,6 +338,7 @@ export default function Accounts() {
   const [editOpenAIModelsLoading, setEditOpenAIModelsLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [showImportPicker, setShowImportPicker] = useState(false);
+  const [showSub2APIImport, setShowSub2APIImport] = useState(false);
   const [dragging, setDragging] = useState(false);
   const dragCounter = useRef(0);
   const [showExportPicker, setShowExportPicker] = useState(false);
@@ -408,6 +419,7 @@ export default function Accounts() {
   >(getInitialAccountVisibleColumns);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
+  const jsonAtInputRef = useRef<HTMLInputElement>(null);
   const atFileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
@@ -615,16 +627,16 @@ export default function Accounts() {
       const has5h =
         account.usage_percent_5h !== null &&
         account.usage_percent_5h !== undefined;
-
-      if (plan === "free") {
-        return !has7d;
-      }
-      if (
+      // 与 UsageCell 的显示判定保持一致:plan_type 可能滞后于真实订阅状态,
+      // 看到 5h 重置时间就当订阅账号处理,触发拉取 5h 数据。
+      const looksLikeSubscription =
         plan === "pro" ||
         plan === "team" ||
         plan === "plus" ||
-        plan === "teamplus"
-      ) {
+        plan === "teamplus" ||
+        !!account.reset_5h_at;
+
+      if (looksLikeSubscription) {
         return !has5h || !has7d;
       }
       return !has7d;
@@ -1049,7 +1061,7 @@ export default function Accounts() {
 
   const importFiles = async (
     files: File[],
-    format: "txt" | "json" | "at_txt",
+    format: "txt" | "json" | "json_at" | "at_txt",
   ) => {
     setImporting(true);
     try {
@@ -1236,6 +1248,14 @@ export default function Accounts() {
     setShowImportPicker(false);
     await importFiles(Array.from(files), "json");
     if (jsonInputRef.current) jsonInputRef.current.value = "";
+  };
+
+  const handleJsonAtImport = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    setShowImportPicker(false);
+    await importFiles(Array.from(files), "json_at");
+    if (jsonAtInputRef.current) jsonAtInputRef.current.value = "";
   };
 
   const handleAtFileImport = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -2228,6 +2248,12 @@ export default function Accounts() {
                       disabled: migrating,
                       onSelect: () => setShowMigrate(true),
                     },
+                    {
+                      key: "sub2api",
+                      label: t("accounts.sub2api.entry"),
+                      icon: <Cloud className="size-3.5" />,
+                      onSelect: () => setShowSub2APIImport(true),
+                    },
                   ]}
                 />
                 <Button onClick={() => setShowAdd(true)}>
@@ -2249,6 +2275,14 @@ export default function Accounts() {
                   multiple
                   className="hidden"
                   onChange={(e) => void handleJsonImport(e)}
+                />
+                <input
+                  ref={jsonAtInputRef}
+                  type="file"
+                  accept=".json"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => void handleJsonAtImport(e)}
                 />
                 <input
                   ref={atFileInputRef}
@@ -3728,6 +3762,23 @@ export default function Accounts() {
                 className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
                 onClick={() => {
                   setShowImportPicker(false);
+                  jsonAtInputRef.current?.click();
+                }}
+              >
+                <FileJson className="size-5 shrink-0 text-muted-foreground" />
+                <div>
+                  <div className="text-sm font-medium">
+                    {t("accounts.importJsonAt")}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {t("accounts.importJsonAtDesc")}
+                  </div>
+                </div>
+              </button>
+              <button
+                className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
+                onClick={() => {
+                  setShowImportPicker(false);
                   atFileInputRef.current?.click();
                 }}
               >
@@ -3760,6 +3811,19 @@ export default function Accounts() {
               </button>
             </div>
           </Modal>
+          <Sub2APIImportModal
+            show={showSub2APIImport}
+            onClose={() => setShowSub2APIImport(false)}
+            onImportStart={async (res) => {
+              setImporting(true);
+              try {
+                await readImportSSE(res);
+              } finally {
+                setImporting(false);
+              }
+            }}
+            onShowToast={(message, kind) => showToast(message, kind ?? "success")}
+          />
 
           <Modal
             show={showExportPicker}
@@ -6252,6 +6316,12 @@ function UsageWindowStat({
 }
 
 // 用量列组件
+//
+// 显示策略不再单独依赖 plan_type:
+// 当 plan_type 还停留在按 RT 刷新出来的旧值(例如 "free")、但账号实际已订阅、
+// 后端已经返回 5h 窗口数据时,只看 plan_type 会把 5h 吞掉。
+// 因此这里以"是否真的存在 5h / 7d 数据(含 reset 时间)"作为主判据,
+// plan_type 仅作为 5h 数据缺位时的辅助提示。
 function UsageCell({ account }: { account: AccountRow }) {
   const plan = normalizePlanType(account.plan_type);
   const has7d =
@@ -6260,33 +6330,21 @@ function UsageCell({ account }: { account: AccountRow }) {
     account.usage_percent_5h !== null && account.usage_percent_5h !== undefined;
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail);
   const has5hDetail = hasUsageWindowDetail(account.usage_5h_detail);
+  const has5hReset = !!account.reset_5h_at;
+  const has7dReset = !!account.reset_7d_at;
 
-  if (plan === "free") {
-    if (!has7d && !has7dDetail)
-      return <span className="text-[12px] text-muted-foreground">-</span>;
-    return (
-      <div className="w-48">
-        {has7d ? (
-          <UsageBar
-            label="7d"
-            pct={account.usage_percent_7d!}
-            resetAt={account.reset_7d_at}
-            detail={account.usage_7d_detail}
-          />
-        ) : (
-          <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
-        )}
-      </div>
-    );
-  }
-
-  if (
+  const fiveHourPresent = has5h || has5hDetail || has5hReset;
+  const sevenDayPresent = has7d || has7dDetail || has7dReset;
+  // plan 表明是订阅型时,即使数据暂未拉到也按订阅布局占位,避免抖动
+  const planSuggestsPremium =
     plan === "pro" ||
     plan === "team" ||
     plan === "plus" ||
-    plan === "teamplus"
-  ) {
-    if (!has5h && !has7d && !has5hDetail && !has7dDetail)
+    plan === "teamplus";
+  const showFiveHour = fiveHourPresent || planSuggestsPremium;
+
+  if (showFiveHour) {
+    if (!has5h && !has7d && !has5hDetail && !has7dDetail && !has5hReset && !has7dReset)
       return <span className="text-[12px] text-muted-foreground">-</span>;
     return (
       <div className="w-52 space-y-1.5">
@@ -6314,7 +6372,7 @@ function UsageCell({ account }: { account: AccountRow }) {
     );
   }
 
-  if (has7d || has7dDetail) {
+  if (sevenDayPresent) {
     return (
       <div className="w-48">
         {has7d ? (
@@ -6330,6 +6388,7 @@ function UsageCell({ account }: { account: AccountRow }) {
       </div>
     );
   }
+
   return <span className="text-[13px] text-muted-foreground">-</span>;
 }
 
