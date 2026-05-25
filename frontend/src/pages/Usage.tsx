@@ -7,7 +7,6 @@ import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
-import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
@@ -95,6 +94,8 @@ function resolveRangeISO(
 }
 
 const USAGE_ANALYSIS_VISIBILITY_KEY = 'usage_analysis_visible'
+const usageStatCardContentClass = 'flex min-w-0 flex-col gap-1.5 p-3'
+const usageStatValueClass = 'min-w-0 break-words text-[20px] font-bold leading-tight tabular-nums sm:text-[22px]'
 
 function getInitialAnalysisVisibility(): boolean {
   try {
@@ -235,6 +236,15 @@ function UsageCostCell({ log }: { log: UsageLog }) {
           {log.cached_tokens > 0 && log.cache_read_price_per_mtoken > 0 && (
             <CostTooltipRow label={t('usage.cacheReadUnitPrice')} value={formatTokenPricePerMillion(log.cache_read_price_per_mtoken)} valueClassName="text-cyan-300" />
           )}
+          <CostTooltipRow
+            label={t('usage.billingTier')}
+            value={(log.service_tier === 'fast' || log.service_tier === 'priority')
+              ? t('usage.billingTierFast')
+              : t('usage.billingTierStandard')}
+            valueClassName={(log.service_tier === 'fast' || log.service_tier === 'priority')
+              ? 'text-amber-300'
+              : 'text-slate-200'}
+          />
         </div>
       </TooltipContent>
     </Tooltip>
@@ -1026,16 +1036,16 @@ export default function Usage() {
 
         <div className="space-y-6">
         {/* Stat overview: 6 metrics in a single row */}
-        <div className="grid grid-cols-6 gap-3 max-xl:grid-cols-3 max-sm:grid-cols-2">
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+        <div className="grid grid-cols-1 gap-3 min-[560px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalRequestsCard')}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-primary/12 text-primary">
                   <Activity className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums">
+              <div className={usageStatValueClass}>
                 {formatTokens(totalRequests)}
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
@@ -1045,15 +1055,15 @@ export default function Usage() {
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalTokensCard')}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(var(--info-bg))] text-[hsl(var(--info))]">
                   <Box className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums">
+              <div className={usageStatValueClass}>
                 {formatTokens(totalTokens)}
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
@@ -1063,15 +1073,15 @@ export default function Usage() {
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalCostCard')}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300">
                   <CircleDollarSign className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums text-emerald-600 dark:text-emerald-400">
+              <div className={`${usageStatValueClass} text-emerald-600 dark:text-emerald-400`}>
                 {formatCostCardValue(totalUserBilled)}
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
@@ -1081,45 +1091,45 @@ export default function Usage() {
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">RPM</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]">
                   <Clock className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums">
+              <div className={usageStatValueClass}>
                 {Math.round(rpm)}
               </div>
               <div className="text-[11px] text-muted-foreground leading-snug">{t('usage.rpmDesc')}</div>
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">TPM</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-destructive/12 text-destructive">
                   <Zap className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums">
+              <div className={usageStatValueClass}>
                 {formatTokens(tpm)}
               </div>
               <div className="text-[11px] text-muted-foreground leading-snug">{t('usage.tpmDesc')}</div>
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.errorRateCard')}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(36_72%_40%/0.12)] text-[hsl(36,72%,40%)]">
                   <AlertTriangle className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums">
+              <div className={usageStatValueClass}>
                 {errorRate.toFixed(1)}%
               </div>
               <div className="text-[11px] text-muted-foreground leading-snug">{t('usage.avgLatencyInline', { value: Math.round(avgDurationMs) })}</div>
@@ -1510,7 +1520,6 @@ export default function Usage() {
         </Card>
         </div>
 
-        <ToastNotice toast={toast} />
         {confirmDialog}
       </>
     </StateShell>

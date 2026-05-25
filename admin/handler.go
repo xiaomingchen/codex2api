@@ -38,21 +38,22 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	store          *auth.Store
-	cache          cache.TokenCache
-	db             *database.DB
-	rateLimiter    *proxy.RateLimiter
-	refreshAccount func(context.Context, int64) error
-	cpuSampler     *cpuSampler
-	startedAt      time.Time
-	pgMaxConns     int
-	redisPoolSize  int
-	databaseDriver string
-	databaseLabel  string
-	cacheDriver    string
-	cacheLabel     string
-	adminSecretEnv string
-	imageProxy     *proxy.Handler
+	store                  *auth.Store
+	cache                  cache.TokenCache
+	db                     *database.DB
+	rateLimiter            *proxy.RateLimiter
+	refreshAccount         func(context.Context, int64) error
+	syncAccountPlanOnReset func(context.Context, *auth.Account) error
+	cpuSampler             *cpuSampler
+	startedAt              time.Time
+	pgMaxConns             int
+	redisPoolSize          int
+	databaseDriver         string
+	databaseLabel          string
+	cacheDriver            string
+	cacheLabel             string
+	adminSecretEnv         string
+	imageProxy             *proxy.Handler
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -178,6 +179,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		handler.imageProxy.SetRuntimeCache(tc)
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
+	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
 	if db != nil {
 		if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
 			log.Printf("标记中断生图任务失败: %v", err)
@@ -232,7 +234,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
+	api.POST("/accounts/usage/probe", h.ForceUsageProbe)
 	api.GET("/usage/stats", h.GetUsageStats)
+	api.GET("/usage/api-keys", h.GetAPIKeyTokenStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
 	api.GET("/usage/account-summary", h.GetAccountUsageSummary)
@@ -2703,6 +2707,7 @@ func (h *Handler) ResetAccountStatus(c *gin.Context) {
 
 	h.store.ClearCooldown(acc)
 	acc.ClearUsageCache()
+	h.syncAccountPlanAfterReset(c.Request.Context(), acc)
 	writeMessage(c, http.StatusOK, "账号状态已重置")
 }
 
@@ -2726,6 +2731,7 @@ func (h *Handler) BatchResetStatus(c *gin.Context) {
 		}
 		h.store.ClearCooldown(acc)
 		acc.ClearUsageCache()
+		h.syncAccountPlanAfterReset(c.Request.Context(), acc)
 		success++
 	}
 
@@ -2734,6 +2740,37 @@ func (h *Handler) BatchResetStatus(c *gin.Context) {
 		"success": success,
 		"failed":  fail,
 	})
+}
+
+func (h *Handler) syncAccountPlanAfterReset(_ context.Context, acc *auth.Account) {
+	if h == nil || h.syncAccountPlanOnReset == nil || acc == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := h.syncAccountPlanOnReset(ctx, acc); err != nil {
+			log.Printf("[账号 %d] 重置后同步 Codex plan type 失败: %v", acc.DBID, err)
+		}
+	}()
+}
+
+func (h *Handler) syncSingleAccountPlanOnReset(ctx context.Context, acc *auth.Account) error {
+	if h == nil || h.store == nil || acc == nil || acc.IsOpenAIResponsesAPI() || acc.GetAccessToken() == "" {
+		return nil
+	}
+	model, err := h.connectionTestModelForAccount(ctx, acc, "")
+	if err != nil {
+		return err
+	}
+	resp, err := proxy.ExecuteRequest(ctx, acc, buildTestPayload(model), "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	proxy.SyncCodexUsageState(h.store, acc, resp)
+	return nil
 }
 
 func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {
@@ -2800,6 +2837,30 @@ func parseUsageStatsRange(startStr, endStr string) (time.Time, time.Time, error)
 		return time.Time{}, time.Time{}, fmt.Errorf("end 必须晚于 start")
 	}
 	return start, end, nil
+}
+
+// GetAPIKeyTokenStats 返回按 API Key 聚合的 token 用量列表（issue #162）。
+// 支持可选 query 参数 start/end (RFC3339)；缺省回落到"今日"。
+// 不分页/不限条数：前端做排序、搜索、分页。
+func (h *Handler) GetAPIKeyTokenStats(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+	defer cancel()
+
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	items, err := h.db.ListAPIKeyTokenStats(ctx, rangeStart, rangeEnd)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if items == nil {
+		items = []database.APIKeyTokenStat{}
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
 // GetChartData 返回图表聚合数据（服务端分桶 + 内存缓存）
@@ -3865,6 +3926,7 @@ type settingsResponse struct {
 	TestConcurrency                  int    `json:"test_concurrency"`
 	BackgroundRefreshIntervalMinutes int    `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes          int    `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency            int    `json:"usage_probe_concurrency"`
 	RecoveryProbeIntervalMinutes     int    `json:"recovery_probe_interval_minutes"`
 	LazyMode                         bool   `json:"lazy_mode"`
 	ProxyURL                         string `json:"proxy_url"`
@@ -3927,6 +3989,7 @@ type updateSettingsReq struct {
 	TestConcurrency                  *int    `json:"test_concurrency"`
 	BackgroundRefreshIntervalMinutes *int    `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes          *int    `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency            *int    `json:"usage_probe_concurrency"`
 	RecoveryProbeIntervalMinutes     *int    `json:"recovery_probe_interval_minutes"`
 	LazyMode                         *bool   `json:"lazy_mode"`
 	ProxyURL                         *string `json:"proxy_url"`
@@ -4069,6 +4132,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		TestConcurrency:                  h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:            h.store.GetUsageProbeConcurrency(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                         h.store.GetLazyMode(),
 		ProxyURL:                         h.store.GetProxyURL(),
@@ -4226,6 +4290,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.store.SetUsageProbeMaxAge(time.Duration(v) * time.Minute)
 		log.Printf("设置已更新: usage_probe_max_age_minutes = %d", v)
+	}
+
+	if req.UsageProbeConcurrency != nil {
+		v := *req.UsageProbeConcurrency
+		if v < 1 {
+			v = 1
+		}
+		if v > 128 {
+			v = 128
+		}
+		h.store.SetUsageProbeConcurrency(v)
+		log.Printf("设置已更新: usage_probe_concurrency = %d", v)
 	}
 
 	if req.RecoveryProbeIntervalMinutes != nil {
@@ -4561,6 +4637,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TestConcurrency:                  h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:            h.store.GetUsageProbeConcurrency(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                         h.store.GetLazyMode(),
 		ProxyURL:                         h.store.GetProxyURL(),
@@ -4626,6 +4703,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TestConcurrency:                  h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:            h.store.GetUsageProbeConcurrency(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                         h.store.GetLazyMode(),
 		ProxyURL:                         h.store.GetProxyURL(),
@@ -4885,6 +4963,11 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 		if rt == "" && at == "" {
 			continue
 		}
+		// account_id 在凭据中存储为 chatgpt_account_id（新字段）或 account_id（历史字段）
+		accountID := row.GetCredential("chatgpt_account_id")
+		if accountID == "" {
+			accountID = row.GetCredential("account_id")
+		}
 		entries = append(entries, cpaExportEntry{
 			Type:                "codex",
 			Email:               row.GetCredential("email"),
@@ -4896,7 +4979,7 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 			CodexUsageUpdatedAt: row.GetCredential("codex_usage_updated_at"),
 			Expired:             row.GetCredential("expires_at"),
 			IDToken:             row.GetCredential("id_token"),
-			AccountID:           row.GetCredential("account_id"),
+			AccountID:           accountID,
 			AccessToken:         at,
 			LastRefresh:         row.UpdatedAt.Format(time.RFC3339),
 			RefreshToken:        rt,
@@ -5071,9 +5154,14 @@ func (h *Handler) CleanBanned(c *gin.Context) {
 	h.cleanByStatus(c, "unauthorized")
 }
 
-// CleanRateLimited 清理限流（rate_limited）账号
+// CleanRateLimited 一键清理所有限流账号（含 premium 5h、free 7d、usage_exhausted）
 func (h *Handler) CleanRateLimited(c *gin.Context) {
-	h.cleanByStatus(c, "rate_limited")
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	cleaned := h.store.CleanRateLimitedManual(ctx)
+
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
 }
 
 // CleanError 清理错误（error）账号

@@ -1815,26 +1815,24 @@ func resolveServiceTier(actualTier, requestedTier string) string {
 	return final
 }
 
-// resolveBillingServiceTier keeps UI tier normalization separate from billing:
-// fast/priority intent is billed as priority only when the upstream does not
-// report a concrete tier, or when it confirms fast/priority. Any concrete
-// upstream tier wins so billing follows the actual tier reported by upstream.
+// resolveBillingServiceTier 按"请求意图"决定计费 tier：
+// 只要客户端显式请求 fast/priority，就锁定为 priority 计费（×2），
+// 不被上游降级值（如 default）掩盖——保证 fast 用户不会因为上游通道波动而漏费。
+// 客户端没指定 tier 时，才回退到上游实际报告的 tier。
 func resolveBillingServiceTier(actualTier, requestedTier string) string {
-	actualTier = strings.ToLower(strings.TrimSpace(actualTier))
-	if actualTier != "" {
-		if actualTier == "priority" || actualTier == "fast" {
-			return "priority"
-		}
-		return actualTier
+	requestedTier = strings.ToLower(strings.TrimSpace(requestedTier))
+	if requestedTier == "priority" || requestedTier == "fast" {
+		return "priority"
 	}
 
-	requestedTier = strings.ToLower(strings.TrimSpace(requestedTier))
-	switch requestedTier {
-	case "priority", "fast":
+	actualTier = strings.ToLower(strings.TrimSpace(actualTier))
+	if actualTier == "priority" || actualTier == "fast" {
 		return "priority"
-	default:
-		return requestedTier
 	}
+	if actualTier != "" {
+		return actualTier
+	}
+	return requestedTier
 }
 
 // 上游不支持的 JSON Schema 验证约束关键字
@@ -1895,6 +1893,11 @@ func sanitizeSchemaForUpstream(schema map[string]interface{}) {
 	stripUnsupportedSchemaKeys(schema)
 	normalizeSchemaRequiredFields(schema)
 	ensureArrayItems(schema)
+}
+
+func sanitizeStructuredOutputSchemaForUpstream(schema map[string]interface{}) {
+	sanitizeSchemaForUpstream(schema)
+	ensureObjectAdditionalPropertiesFalse(schema)
 }
 
 func normalizeResponsesStructuredOutputFormat(body map[string]any) bool {
@@ -2053,12 +2056,12 @@ func responsesTextFormatFromResponseFormat(responseFormat map[string]any) map[st
 func sanitizeStructuredOutputSchema(format map[string]any) bool {
 	modified := false
 	if schema, ok := format["schema"].(map[string]any); ok && schema != nil {
-		sanitizeSchemaForUpstream(schema)
+		sanitizeStructuredOutputSchemaForUpstream(schema)
 		modified = true
 	}
 	if jsonSchema, ok := format["json_schema"].(map[string]any); ok && jsonSchema != nil {
 		if schema, ok := jsonSchema["schema"].(map[string]any); ok && schema != nil {
-			sanitizeSchemaForUpstream(schema)
+			sanitizeStructuredOutputSchemaForUpstream(schema)
 			modified = true
 		}
 	}
@@ -2185,6 +2188,41 @@ func ensureArrayItems(schema map[string]interface{}) {
 	}
 }
 
+func ensureObjectAdditionalPropertiesFalse(schema map[string]interface{}) {
+	if schemaDeclaresObject(schema) {
+		schema["additionalProperties"] = false
+	}
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		for _, v := range props {
+			if sub, ok := v.(map[string]interface{}); ok {
+				ensureObjectAdditionalPropertiesFalse(sub)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]interface{}); ok {
+		ensureObjectAdditionalPropertiesFalse(items)
+	}
+	for _, key := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := schema[key].([]interface{}); ok {
+			for _, item := range arr {
+				if sub, ok := item.(map[string]interface{}); ok {
+					ensureObjectAdditionalPropertiesFalse(sub)
+				}
+			}
+		}
+	}
+	if addProps, ok := schema["additionalProperties"].(map[string]interface{}); ok {
+		ensureObjectAdditionalPropertiesFalse(addProps)
+	}
+	if defs, ok := schema["$defs"].(map[string]interface{}); ok {
+		for _, v := range defs {
+			if sub, ok := v.(map[string]interface{}); ok {
+				ensureObjectAdditionalPropertiesFalse(sub)
+			}
+		}
+	}
+}
+
 func schemaDeclaresArray(schema map[string]interface{}) bool {
 	switch t := schema["type"].(type) {
 	case string:
@@ -2192,6 +2230,20 @@ func schemaDeclaresArray(schema map[string]interface{}) bool {
 	case []interface{}:
 		for _, item := range t {
 			if s, ok := item.(string); ok && s == "array" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func schemaDeclaresObject(schema map[string]interface{}) bool {
+	switch t := schema["type"].(type) {
+	case string:
+		return t == "object"
+	case []interface{}:
+		for _, item := range t {
+			if s, ok := item.(string); ok && s == "object" {
 				return true
 			}
 		}

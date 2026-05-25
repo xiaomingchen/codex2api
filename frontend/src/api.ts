@@ -7,6 +7,7 @@ import type {
   AddOpenAIResponsesAccountRequest,
   AdminErrorResponse,
   APIKeysResponse,
+  APIKeyTokenStat,
   AccountsResponse,
   ChartAggregation,
   CreateAccountResponse,
@@ -228,6 +229,8 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
+  forceUsageProbe: () =>
+    request<{ triggered: boolean; concurrency: number; reason?: string }>(`/accounts/usage/probe`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
   listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
@@ -307,6 +310,15 @@ export const api = {
     if (params.end) searchParams.set('end', params.end)
     const qs = searchParams.toString()
     return request<UsageStats>(qs ? `/usage/stats?${qs}` : '/usage/stats')
+  },
+  getAPIKeyTokenStats: (params: { start?: string; end?: string } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.start) searchParams.set('start', params.start)
+    if (params.end) searchParams.set('end', params.end)
+    const qs = searchParams.toString()
+    return request<{ items: APIKeyTokenStat[] }>(
+      qs ? `/usage/api-keys?${qs}` : '/usage/api-keys',
+    )
   },
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams()

@@ -339,6 +339,7 @@ export interface SystemSettings {
   test_concurrency: number
   background_refresh_interval_minutes: number
   usage_probe_max_age_minutes: number
+  usage_probe_concurrency: number
   recovery_probe_interval_minutes: number
   lazy_mode: boolean
   proxy_url?: string
@@ -568,6 +569,22 @@ export interface UsageAPIKeyStat {
   label: string
   requests: number
   tokens: number
+  error_count: number
+  user_billed: number
+}
+
+// APIKeyTokenStat 是 /usage/api-keys 端点返回项，比 UsageAPIKeyStat 字段更细
+// （分列 input/output/cached token），且不限条数。
+export interface APIKeyTokenStat {
+  api_key_id: number
+  api_key_name: string
+  api_key_masked: string
+  label: string
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  total_tokens: number
   error_count: number
   user_billed: number
 }

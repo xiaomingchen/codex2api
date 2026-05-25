@@ -136,6 +136,7 @@ type AccountFilter func(*Account) bool
 const (
 	defaultBackgroundRefreshInterval = 2 * time.Minute
 	defaultUsageProbeMaxAge          = 10 * time.Minute
+	defaultUsageProbeConcurrency     = 16
 	defaultRecoveryProbeInterval     = 30 * time.Minute
 	premium5hUrgencyWindow           = 4 * time.Hour
 	premium5hUrgencyMaxBonus         = 25.0
@@ -1504,6 +1505,7 @@ type Store struct {
 	maxRateLimitRetries       int64 // 429 最大换号重试次数
 	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
 	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
+	usageProbeConcurrency     int64 // 用量探针并行度
 	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
 	backgroundRefreshWakeCh   chan struct{}
 	lazyRefreshInFlight       sync.Map
@@ -1897,6 +1899,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			TestModel:                        "gpt-5.4",
 			BackgroundRefreshIntervalMinutes: 2,
 			UsageProbeMaxAgeMinutes:          10,
+			UsageProbeConcurrency:            defaultUsageProbeConcurrency,
 			RecoveryProbeIntervalMinutes:     30,
 			LazyMode:                         false,
 			ProxyURL:                         "",
@@ -1918,6 +1921,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.testModel.Store(settings.TestModel)
 	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
 	s.SetUsageProbeMaxAge(time.Duration(settings.UsageProbeMaxAgeMinutes) * time.Minute)
+	s.SetUsageProbeConcurrency(settings.UsageProbeConcurrency)
 	s.SetRecoveryProbeInterval(time.Duration(settings.RecoveryProbeIntervalMinutes) * time.Minute)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
@@ -2249,6 +2253,26 @@ func (s *Store) GetUsageProbeMaxAge() time.Duration {
 	return d
 }
 
+// SetUsageProbeConcurrency 设置用量探针并行度。
+func (s *Store) SetUsageProbeConcurrency(n int) {
+	if n <= 0 {
+		n = defaultUsageProbeConcurrency
+	}
+	if n > 128 {
+		n = 128
+	}
+	atomic.StoreInt64(&s.usageProbeConcurrency, int64(n))
+}
+
+// GetUsageProbeConcurrency 获取用量探针并行度。
+func (s *Store) GetUsageProbeConcurrency() int {
+	n := int(atomic.LoadInt64(&s.usageProbeConcurrency))
+	if n <= 0 {
+		return defaultUsageProbeConcurrency
+	}
+	return n
+}
+
 // SetRecoveryProbeInterval 设置恢复探测最小间隔。
 func (s *Store) SetRecoveryProbeInterval(d time.Duration) {
 	if d <= 0 {
@@ -2514,7 +2538,9 @@ func (s *Store) Stop() {
 	s.wg.Wait()
 }
 
-// CleanByRuntimeStatus 按运行时状态清理账号
+// CleanByRuntimeStatus 按运行时状态清理账号（用于自动清理流程）
+// premium 5h 限流账号会被跳过，因为它们会在 5h 内自然恢复，无需删除。
+// 手动一键清理请改用 CleanRateLimitedManual——它会清掉所有限流账号。
 func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) int {
 	accounts := s.Accounts()
 	cleaned := 0
@@ -2543,6 +2569,45 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 		cleaned++
 		if s.db != nil {
 			s.db.InsertAccountEventAsync(acc.DBID, "deleted", "auto_clean")
+		}
+	}
+
+	return cleaned
+}
+
+// CleanRateLimitedManual 清理所有"限流"含义下的账号（用于手动一键清理）。
+// 与 CleanByRuntimeStatus("rate_limited") 的区别：
+//   - 涵盖 RuntimeStatus 的全部限流相关值：rate_limited / usage_exhausted
+//   - 不跳过 premium 5h 限流：手动触发即代表用户明确意图删除
+//   - 锁定账号依然跳过（与所有清理流程一致）
+func (s *Store) CleanRateLimitedManual(ctx context.Context) int {
+	accounts := s.Accounts()
+	cleaned := 0
+
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		status := acc.RuntimeStatus()
+		if status != "rate_limited" && status != "usage_exhausted" {
+			continue
+		}
+
+		if atomic.LoadInt32(&acc.Locked) == 1 {
+			continue
+		}
+
+		if s.db != nil {
+			if err := s.db.SoftDeleteAccount(ctx, acc.DBID); err != nil {
+				log.Printf("[账号 %d] 手动清理限流账号失败: %v", acc.DBID, err)
+				continue
+			}
+		}
+
+		s.RemoveAccount(acc.DBID)
+		cleaned++
+		if s.db != nil {
+			s.db.InsertAccountEventAsync(acc.DBID, "deleted", "manual_clean")
 		}
 	}
 
@@ -3974,6 +4039,39 @@ func (s *Store) PersistUsageSnapshot(acc *Account, pct7d float64) {
 	}
 }
 
+// UpdateAccountPlanType persists the latest Codex plan type observed from upstream headers.
+func (s *Store) UpdateAccountPlanType(acc *Account, planType string) bool {
+	if s == nil || acc == nil {
+		return false
+	}
+	plan := strings.ToLower(strings.TrimSpace(planType))
+	if plan == "" {
+		return false
+	}
+
+	acc.mu.Lock()
+	changed := acc.PlanType != plan
+	if changed {
+		acc.PlanType = plan
+		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	}
+	acc.mu.Unlock()
+	if changed {
+		s.fastSchedulerUpdate(acc)
+	}
+
+	if s.db == nil || !changed {
+		return changed
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"plan_type": plan}); err != nil {
+		log.Printf("[账号 %d] 持久化 plan_type 失败: %v", acc.DBID, err)
+	}
+	return changed
+}
+
 // ApplyUsageLimitMetadata applies metadata returned by Codex usage_limit_reached errors.
 func (s *Store) ApplyUsageLimitMetadata(acc *Account, planType string, resetAt time.Time) {
 	if acc == nil {
@@ -4250,6 +4348,12 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 }
 
 func (s *Store) parallelProbeUsage(ctx context.Context) {
+	s.parallelProbeUsageWith(ctx, s.GetUsageProbeMaxAge())
+}
+
+// parallelProbeUsageWith 以指定 maxAge 阈值执行一次批量用量探针。
+// maxAge<=0 时视为"立即探针"——只要账号能跑就刷一次。
+func (s *Store) parallelProbeUsageWith(ctx context.Context, maxAge time.Duration) {
 	s.usageProbeMu.RLock()
 	probeFn := s.usageProbe
 	s.usageProbeMu.RUnlock()
@@ -4262,11 +4366,11 @@ func (s *Store) parallelProbeUsage(ctx context.Context) {
 	copy(accounts, s.accounts)
 	s.mu.RUnlock()
 
-	sem := make(chan struct{}, 4)
+	sem := make(chan struct{}, s.GetUsageProbeConcurrency())
 	var wg sync.WaitGroup
 
 	for _, acc := range accounts {
-		if !acc.NeedsUsageProbe(s.GetUsageProbeMaxAge()) {
+		if !acc.NeedsUsageProbe(maxAge) {
 			continue
 		}
 		if !acc.TryBeginUsageProbe() {
@@ -4289,6 +4393,22 @@ func (s *Store) parallelProbeUsage(ctx context.Context) {
 	}
 
 	wg.Wait()
+}
+
+// TriggerUsageProbeForceAsync 异步触发一次"无视缓存阈值"的批量用量探针。
+// 用于管理端手动刷新场景。
+func (s *Store) TriggerUsageProbeForceAsync() {
+	if s.GetLazyMode() {
+		return
+	}
+	if !s.usageProbeBatch.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer s.usageProbeBatch.Store(false)
+		s.parallelProbeUsageWith(context.Background(), 0)
+	}()
 }
 
 func (s *Store) parallelRecoveryProbe(ctx context.Context) {
