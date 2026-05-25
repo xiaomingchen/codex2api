@@ -2654,6 +2654,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
 		var bestLoad int64 = math.MaxInt64
+		var bestLastUsedAt int64 = math.MaxInt64
 		maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 
 		for _, acc := range s.accounts {
@@ -2677,13 +2678,16 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 			}
 
 			priority := tierPriority(tier)
+			lastUsedAt := atomic.LoadInt64(&acc.LastUsedAt)
 			if priority > bestPriority ||
 				(priority == bestPriority && (dispatchScore > bestDispatchScore ||
 					(dispatchScore == bestDispatchScore && load < bestLoad) ||
-					(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))) {
+					(dispatchScore == bestDispatchScore && load == bestLoad && (lastUsedAt < bestLastUsedAt ||
+						(lastUsedAt == bestLastUsedAt && fastRandN(2) == 0))))) {
 				bestPriority = priority
 				bestDispatchScore = dispatchScore
 				bestLoad = load
+				bestLastUsedAt = lastUsedAt
 				best = acc
 			}
 		}
@@ -2812,6 +2816,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
 		var bestLoad int64 = math.MaxInt64
+		var bestLastUsedAt int64 = math.MaxInt64
 		maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 
 		for _, acc := range s.accounts {
@@ -2842,13 +2847,16 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 			}
 
 			priority := tierPriority(tier)
+			lastUsedAt := atomic.LoadInt64(&acc.LastUsedAt)
 			if priority > bestPriority ||
 				(priority == bestPriority && (dispatchScore > bestDispatchScore ||
 					(dispatchScore == bestDispatchScore && load < bestLoad) ||
-					(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))) {
+					(dispatchScore == bestDispatchScore && load == bestLoad && (lastUsedAt < bestLastUsedAt ||
+						(lastUsedAt == bestLastUsedAt && fastRandN(2) == 0))))) {
 				bestPriority = priority
 				bestDispatchScore = dispatchScore
 				bestLoad = load
+				bestLastUsedAt = lastUsedAt
 				best = acc
 			}
 		}

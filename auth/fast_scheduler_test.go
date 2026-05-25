@@ -20,6 +20,20 @@ func newFastSchedulerTestAccount(id int64, tier AccountHealthTier, score float64
 	}
 }
 
+func collectFastSchedulerOrder(t *testing.T, scheduler *FastScheduler, count int) []int64 {
+	t.Helper()
+
+	got := make([]int64, 0, count)
+	for i := 0; i < count; i++ {
+		acc := scheduler.Acquire()
+		if acc == nil {
+			t.Fatalf("Acquire() returned nil at iteration %d", i)
+		}
+		got = append(got, acc.DBID)
+	}
+	return got
+}
+
 func TestFastSchedulerAcquirePrefersHealthyTier(t *testing.T) {
 	warm := newFastSchedulerTestAccount(1, HealthTierWarm, 90, 2)
 	healthy := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 2)
@@ -123,6 +137,173 @@ func TestFastSchedulerRoundRobinWithinTier(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("round robin mismatch: got=%v want=%v", got, want)
 		}
+	}
+}
+
+func TestFastSchedulerRebuildHealthyRoundRobinOrdersByUsageLastUsedAndScore(t *testing.T) {
+	now := time.Now()
+	lowUsage := newFastSchedulerTestAccount(1, HealthTierHealthy, 50, 1)
+	lowUsage.UsagePercent7d = 10
+	lowUsage.UsagePercent7dValid = true
+	atomic.StoreInt64(&lowUsage.LastUsedAt, now.Add(-time.Hour).UnixNano())
+
+	olderLowScore := newFastSchedulerTestAccount(2, HealthTierHealthy, 10, 1)
+	olderLowScore.UsagePercent7d = 40
+	olderLowScore.UsagePercent7dValid = true
+	atomic.StoreInt64(&olderLowScore.LastUsedAt, now.Add(-3*time.Hour).UnixNano())
+
+	olderHighScore := newFastSchedulerTestAccount(3, HealthTierHealthy, 100, 1)
+	olderHighScore.UsagePercent7d = 40
+	olderHighScore.UsagePercent7dValid = true
+	atomic.StoreInt64(&olderHighScore.LastUsedAt, now.Add(-3*time.Hour).UnixNano())
+
+	newerTopScore := newFastSchedulerTestAccount(4, HealthTierHealthy, 200, 1)
+	newerTopScore.UsagePercent7d = 40
+	newerTopScore.UsagePercent7dValid = true
+	atomic.StoreInt64(&newerTopScore.LastUsedAt, now.Add(-30*time.Minute).UnixNano())
+
+	scheduler := NewFastScheduler(1, "round_robin")
+	scheduler.Rebuild([]*Account{newerTopScore, olderLowScore, lowUsage, olderHighScore})
+
+	got := collectFastSchedulerOrder(t, scheduler, 4)
+	want := []int64{1, 4, 3, 2}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("round_robin rebuild order mismatch: got=%v want=%v", got, want)
+		}
+	}
+}
+
+func TestFastSchedulerRemainingQuotaTieBreaksByOldestLastUsedAt(t *testing.T) {
+	older := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 2)
+	older.UsagePercent7d = 40
+	older.UsagePercent7dValid = true
+	atomic.StoreInt64(&older.LastUsedAt, time.Now().Add(-2*time.Hour).UnixNano())
+
+	newer := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 2)
+	newer.UsagePercent7d = 40
+	newer.UsagePercent7dValid = true
+	atomic.StoreInt64(&newer.LastUsedAt, time.Now().Add(-10*time.Minute).UnixNano())
+
+	scheduler := NewFastScheduler(2, "remaining_quota")
+	scheduler.Rebuild([]*Account{newer, older})
+
+	got := scheduler.Acquire()
+	if got == nil || got.DBID != older.DBID {
+		t.Fatalf("Acquire() picked %+v, want older last_used_at account %d", got, older.DBID)
+	}
+}
+
+func TestFastSchedulerSetSchedulerModeHealthyRoundRobinResortsBuckets(t *testing.T) {
+	now := time.Now()
+	lowUsage := newFastSchedulerTestAccount(1, HealthTierHealthy, 50, 1)
+	lowUsage.UsagePercent7d = 10
+	lowUsage.UsagePercent7dValid = true
+	atomic.StoreInt64(&lowUsage.LastUsedAt, now.Add(-time.Hour).UnixNano())
+
+	olderLowScore := newFastSchedulerTestAccount(2, HealthTierHealthy, 10, 1)
+	olderLowScore.UsagePercent7d = 40
+	olderLowScore.UsagePercent7dValid = true
+	atomic.StoreInt64(&olderLowScore.LastUsedAt, now.Add(-3*time.Hour).UnixNano())
+
+	olderHighScore := newFastSchedulerTestAccount(3, HealthTierHealthy, 100, 1)
+	olderHighScore.UsagePercent7d = 40
+	olderHighScore.UsagePercent7dValid = true
+	atomic.StoreInt64(&olderHighScore.LastUsedAt, now.Add(-3*time.Hour).UnixNano())
+
+	newerTopScore := newFastSchedulerTestAccount(4, HealthTierHealthy, 200, 1)
+	newerTopScore.UsagePercent7d = 40
+	newerTopScore.UsagePercent7dValid = true
+	atomic.StoreInt64(&newerTopScore.LastUsedAt, now.Add(-30*time.Minute).UnixNano())
+
+	scheduler := NewFastScheduler(1, "remaining_quota")
+	scheduler.Rebuild([]*Account{newerTopScore, olderLowScore, lowUsage, olderHighScore})
+
+	scheduler.SetSchedulerMode("round_robin")
+
+	got := collectFastSchedulerOrder(t, scheduler, 4)
+	want := []int64{1, 4, 3, 2}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("round_robin mode switch order mismatch: got=%v want=%v", got, want)
+		}
+	}
+}
+
+func TestStoreNextExcludingTieBreaksByOldestLastUsedAt(t *testing.T) {
+	older := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 1)
+	newer := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
+	atomic.StoreInt64(&older.LastUsedAt, time.Now().Add(-90*time.Minute).UnixNano())
+	atomic.StoreInt64(&newer.LastUsedAt, time.Now().Add(-5*time.Minute).UnixNano())
+
+	store := &Store{
+		accounts:       []*Account{newer, older},
+		maxConcurrency: 1,
+	}
+
+	got := store.NextExcluding(0, nil)
+	if got == nil || got.DBID != older.DBID {
+		t.Fatalf("NextExcluding() picked %+v, want older last_used_at account %d", got, older.DBID)
+	}
+}
+
+func TestFastSchedulerRoundRobinTreatsNeverUsedAsOldest(t *testing.T) {
+	neverUsed := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 2)
+	neverUsed.UsagePercent7d = 20
+	neverUsed.UsagePercent7dValid = true
+
+	usedRecently := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 2)
+	usedRecently.UsagePercent7d = 20
+	usedRecently.UsagePercent7dValid = true
+	atomic.StoreInt64(&usedRecently.LastUsedAt, time.Now().Add(-15*time.Minute).UnixNano())
+
+	scheduler := NewFastScheduler(2, "round_robin")
+	scheduler.Rebuild([]*Account{usedRecently, neverUsed})
+
+	got := scheduler.Acquire()
+	if got == nil || got.DBID != neverUsed.DBID {
+		t.Fatalf("Acquire() picked %+v, want never-used account %d", got, neverUsed.DBID)
+	}
+}
+
+func TestFastSchedulerRoundRobinHealthyRebuildPrefersDispatchScoreBeforeLastUsedAt(t *testing.T) {
+	older := newFastSchedulerTestAccount(2, HealthTierHealthy, 60, 2)
+	older.UsagePercent7d = 20
+	older.UsagePercent7dValid = true
+	atomic.StoreInt64(&older.LastUsedAt, time.Now().Add(-2*time.Hour).UnixNano())
+
+	newer := newFastSchedulerTestAccount(1, HealthTierHealthy, 90, 2)
+	newer.UsagePercent7d = 20
+	newer.UsagePercent7dValid = true
+	atomic.StoreInt64(&newer.LastUsedAt, time.Now().Add(-10*time.Minute).UnixNano())
+
+	scheduler := NewFastScheduler(2, "round_robin")
+	scheduler.Rebuild([]*Account{newer, older})
+
+	got := scheduler.Acquire()
+	if got == nil || got.DBID != newer.DBID {
+		t.Fatalf("Acquire() picked %+v, want higher dispatchScore account %d", got, newer.DBID)
+	}
+}
+
+func TestFastSchedulerRoundRobinSetSchedulerModeHealthyPrefersDispatchScoreBeforeLastUsedAt(t *testing.T) {
+	older := newFastSchedulerTestAccount(2, HealthTierHealthy, 60, 2)
+	older.UsagePercent7d = 20
+	older.UsagePercent7dValid = true
+	atomic.StoreInt64(&older.LastUsedAt, time.Now().Add(-3*time.Hour).UnixNano())
+
+	newer := newFastSchedulerTestAccount(1, HealthTierHealthy, 90, 2)
+	newer.UsagePercent7d = 20
+	newer.UsagePercent7dValid = true
+	atomic.StoreInt64(&newer.LastUsedAt, time.Now().Add(-15*time.Minute).UnixNano())
+
+	scheduler := NewFastScheduler(2, "remaining_quota")
+	scheduler.Rebuild([]*Account{newer, older})
+	scheduler.SetSchedulerMode("round_robin")
+
+	got := scheduler.Acquire()
+	if got == nil || got.DBID != newer.DBID {
+		t.Fatalf("Acquire() picked %+v, want higher dispatchScore account %d", got, newer.DBID)
 	}
 }
 
@@ -794,32 +975,32 @@ func TestFastSchedulerRelease(t *testing.T) {
 
 func TestFastSchedulerRemainingQuotaPicksLowestUsage(t *testing.T) {
 	highUsage := &Account{
-		DBID:                1,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      90,
-		UsagePercent7dValid: true,
+		DBID:                     1,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           90,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 4,
 		DynamicConcurrencyLimit:  4,
 	}
 	lowUsage := &Account{
-		DBID:                2,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      10,
-		UsagePercent7dValid: true,
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           10,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 4,
 		DynamicConcurrencyLimit:  4,
 	}
 	midUsage := &Account{
-		DBID:                3,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      50,
-		UsagePercent7dValid: true,
+		DBID:                     3,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           50,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 4,
 		DynamicConcurrencyLimit:  4,
 	}
@@ -840,32 +1021,32 @@ func TestFastSchedulerRemainingQuotaPicksLowestUsage(t *testing.T) {
 
 func TestFastSchedulerRemainingQuotaSortOrder(t *testing.T) {
 	a1 := &Account{
-		DBID:                1,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      70,
-		UsagePercent7dValid: true,
+		DBID:                     1,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           70,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 1,
 		DynamicConcurrencyLimit:  1,
 	}
 	a2 := &Account{
-		DBID:                2,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      30,
-		UsagePercent7dValid: true,
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           30,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 1,
 		DynamicConcurrencyLimit:  1,
 	}
 	a3 := &Account{
-		DBID:                3,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      90,
-		UsagePercent7dValid: true,
+		DBID:                     3,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           90,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 1,
 		DynamicConcurrencyLimit:  1,
 	}
@@ -895,24 +1076,24 @@ func TestFastSchedulerRemainingQuotaSortOrder(t *testing.T) {
 
 func TestFastSchedulerRemainingQuotaTieBreakProvenThenDBID(t *testing.T) {
 	unproven := &Account{
-		DBID:                1,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      50,
-		UsagePercent7dValid: true,
+		DBID:                     1,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           50,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 2,
 		DynamicConcurrencyLimit:  2,
 	}
 	unproven.TotalRequests = 0 // not proven
 
 	proven := &Account{
-		DBID:                2,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      50,
-		UsagePercent7dValid: true,
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           50,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 2,
 		DynamicConcurrencyLimit:  2,
 	}
@@ -930,6 +1111,40 @@ func TestFastSchedulerRemainingQuotaTieBreakProvenThenDBID(t *testing.T) {
 
 	if got.DBID != proven.DBID {
 		t.Fatalf("Acquire() picked dbID=%d, want proven tie-breaker account %d", got.DBID, proven.DBID)
+	}
+}
+
+func TestFastSchedulerReordersAfterAcquireUpdatesLastUsedAt(t *testing.T) {
+	older := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 2)
+	older.UsagePercent7d = 40
+	older.UsagePercent7dValid = true
+	atomic.StoreInt64(&older.LastUsedAt, time.Now().Add(-2*time.Hour).UnixNano())
+
+	newer := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 2)
+	newer.UsagePercent7d = 40
+	newer.UsagePercent7dValid = true
+	atomic.StoreInt64(&newer.LastUsedAt, time.Now().Add(-10*time.Minute).UnixNano())
+
+	scheduler := NewFastScheduler(2, "remaining_quota")
+	scheduler.Rebuild([]*Account{newer, older})
+
+	first := scheduler.Acquire()
+	if first == nil {
+		t.Fatal("first Acquire() returned nil")
+	}
+	if first.DBID != older.DBID {
+		t.Fatalf("first Acquire() picked dbID=%d, want older account %d", first.DBID, older.DBID)
+	}
+	scheduler.Release(first)
+
+	second := scheduler.Acquire()
+	if second == nil {
+		t.Fatal("second Acquire() returned nil")
+	}
+	defer scheduler.Release(second)
+
+	if second.DBID != newer.DBID {
+		t.Fatalf("second Acquire() picked dbID=%d, want re-ordered account %d", second.DBID, newer.DBID)
 	}
 }
 

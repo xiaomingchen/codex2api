@@ -26,6 +26,88 @@ type fastSchedulerPosition struct {
 	index int
 }
 
+func olderLastUsedFirst(left, right *Account) bool {
+	leftAt := atomic.LoadInt64(&left.LastUsedAt)
+	rightAt := atomic.LoadInt64(&right.LastUsedAt)
+	if leftAt == rightAt {
+		return false
+	}
+	if leftAt == 0 {
+		return true
+	}
+	if rightAt == 0 {
+		return false
+	}
+	return leftAt < rightAt
+}
+
+func sortFastSchedulerEntries(entries []fastSchedulerEntry, mode string, tier AccountHealthTier) {
+	if len(entries) == 0 {
+		return
+	}
+
+	if mode == "remaining_quota" {
+		sort.SliceStable(entries, func(i, j int) bool {
+			usageI := entries[i].acc.usagePercentForScheduling()
+			usageJ := entries[j].acc.usagePercentForScheduling()
+			if usageI != usageJ {
+				return usageI < usageJ
+			}
+			if entries[i].proven != entries[j].proven {
+				return entries[i].proven
+			}
+			if olderLastUsedFirst(entries[i].acc, entries[j].acc) {
+				return true
+			}
+			if olderLastUsedFirst(entries[j].acc, entries[i].acc) {
+				return false
+			}
+			return entries[i].dbID < entries[j].dbID
+		})
+		return
+	}
+
+	if mode == "round_robin" && tier == HealthTierHealthy {
+		sort.SliceStable(entries, func(i, j int) bool {
+			usageI := entries[i].acc.usagePercentForScheduling()
+			usageJ := entries[j].acc.usagePercentForScheduling()
+			if usageI != usageJ {
+				return usageI < usageJ
+			}
+			if entries[i].dispatchScore != entries[j].dispatchScore {
+				return entries[i].dispatchScore > entries[j].dispatchScore
+			}
+			if entries[i].proven != entries[j].proven {
+				return entries[i].proven
+			}
+			if olderLastUsedFirst(entries[i].acc, entries[j].acc) {
+				return true
+			}
+			if olderLastUsedFirst(entries[j].acc, entries[i].acc) {
+				return false
+			}
+			return entries[i].dbID < entries[j].dbID
+		})
+		return
+	}
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].dispatchScore != entries[j].dispatchScore {
+			return entries[i].dispatchScore > entries[j].dispatchScore
+		}
+		if entries[i].proven != entries[j].proven {
+			return entries[i].proven
+		}
+		if olderLastUsedFirst(entries[i].acc, entries[j].acc) {
+			return true
+		}
+		if olderLastUsedFirst(entries[j].acc, entries[i].acc) {
+			return false
+		}
+		return entries[i].dbID < entries[j].dbID
+	})
+}
+
 // FastScheduler 是一个仅使用本地内存的调度器 POC。
 // 它不在请求热路径内重算全量 score，而是直接复用 Account 上已缓存的
 // HealthTier / DispatchScore / DynamicConcurrencyLimit。
@@ -87,29 +169,7 @@ func (s *FastScheduler) SetSchedulerMode(mode string) {
 		if len(entries) == 0 {
 			continue
 		}
-		if mode == "remaining_quota" {
-			sort.SliceStable(entries, func(i, j int) bool {
-				usageI := entries[i].acc.usagePercentForScheduling()
-				usageJ := entries[j].acc.usagePercentForScheduling()
-				if usageI == usageJ {
-					if entries[i].proven != entries[j].proven {
-						return entries[i].proven
-					}
-					return entries[i].dbID < entries[j].dbID
-				}
-				return usageI < usageJ
-			})
-		} else {
-			sort.SliceStable(entries, func(i, j int) bool {
-				if entries[i].dispatchScore == entries[j].dispatchScore {
-					if entries[i].proven != entries[j].proven {
-						return entries[i].proven
-					}
-					return entries[i].dbID < entries[j].dbID
-				}
-				return entries[i].dispatchScore > entries[j].dispatchScore
-			})
-		}
+		sortFastSchedulerEntries(entries, mode, tier)
 		s.buckets[tier] = entries
 		s.rebuildPositionsLocked(tier)
 	}
@@ -183,29 +243,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		if len(entries) == 0 {
 			continue
 		}
-		if s.schedulerMode == "remaining_quota" {
-			sort.SliceStable(entries, func(i, j int) bool {
-				usageI := entries[i].acc.usagePercentForScheduling()
-				usageJ := entries[j].acc.usagePercentForScheduling()
-				if usageI == usageJ {
-					if entries[i].proven != entries[j].proven {
-						return entries[i].proven
-					}
-					return entries[i].dbID < entries[j].dbID
-				}
-				return usageI < usageJ
-			})
-		} else {
-			sort.SliceStable(entries, func(i, j int) bool {
-				if entries[i].dispatchScore == entries[j].dispatchScore {
-					if entries[i].proven != entries[j].proven {
-						return entries[i].proven
-					}
-					return entries[i].dbID < entries[j].dbID
-				}
-				return entries[i].dispatchScore > entries[j].dispatchScore
-			})
-		}
+		sortFastSchedulerEntries(entries, s.schedulerMode, tier)
 		s.buckets[tier] = entries
 		s.rebuildPositionsLocked(tier)
 	}
@@ -335,6 +373,10 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 		if !tryAcquireAccount(entry.acc, limit) {
 			continue
 		}
+		if s.schedulerMode == "remaining_quota" {
+			s.removeLocked(entry.dbID)
+			s.insertLocked(entry.acc, now)
+		}
 		return entry.acc, false
 	}
 	return nil, false
@@ -380,47 +422,7 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		dispatchScore: dispatchScore,
 		proven:        proven,
 	})
-	if s.schedulerMode == "remaining_quota" {
-		sort.SliceStable(entries, func(i, j int) bool {
-			usageI := entries[i].acc.usagePercentForScheduling()
-			usageJ := entries[j].acc.usagePercentForScheduling()
-			if usageI == usageJ {
-				if entries[i].proven != entries[j].proven {
-					return entries[i].proven
-				}
-				return entries[i].dbID < entries[j].dbID
-			}
-			return usageI < usageJ
-		})
-	} else if s.schedulerMode == "round_robin" && tier == HealthTierHealthy {
-		// round_robin 模式下,healthy 桶按 7d 用量 ASC 排序后再走轮询。
-		// 这样同一个 round 里,用得少的账号被先轮到,自然把负载摊平到所有可用账号上,
-		// 避免出现"轮询模式仍然一直薅同一个号"的现象 (issue #150)。
-		sort.SliceStable(entries, func(i, j int) bool {
-			usageI := entries[i].acc.usagePercentForScheduling()
-			usageJ := entries[j].acc.usagePercentForScheduling()
-			if usageI == usageJ {
-				if entries[i].dispatchScore != entries[j].dispatchScore {
-					return entries[i].dispatchScore > entries[j].dispatchScore
-				}
-				if entries[i].proven != entries[j].proven {
-					return entries[i].proven
-				}
-				return entries[i].dbID < entries[j].dbID
-			}
-			return usageI < usageJ
-		})
-	} else {
-		sort.SliceStable(entries, func(i, j int) bool {
-			if entries[i].dispatchScore == entries[j].dispatchScore {
-				if entries[i].proven != entries[j].proven {
-					return entries[i].proven
-				}
-				return entries[i].dbID < entries[j].dbID
-			}
-			return entries[i].dispatchScore > entries[j].dispatchScore
-		})
-	}
+	sortFastSchedulerEntries(entries, s.schedulerMode, tier)
 	s.buckets[tier] = entries
 	s.rebuildPositionsLocked(tier)
 }
