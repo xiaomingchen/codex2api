@@ -1109,3 +1109,17 @@ export interface OAuthExchangeResponse {
   email: string
   plan_type: string
 }
+
+export interface OAuthReauthorizeRequest {
+  session_id: string
+  code: string
+  state: string
+  proxy_url?: string
+}
+
+export interface OAuthReauthorizeResponse {
+  message: string
+  id: number
+  email: string
+  plan_type: string
+}

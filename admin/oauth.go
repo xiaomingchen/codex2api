@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	neturl "net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,11 +36,12 @@ const (
 // ==================== 内存 Session 存储 ====================
 
 type oauthSession struct {
-	State        string
-	CodeVerifier string
-	RedirectURI  string
-	ProxyURL     string
-	CreatedAt    time.Time
+	State                string
+	CodeVerifier         string
+	RedirectURI          string
+	ProxyURL             string
+	ReauthorizeAccountID int64
+	CreatedAt            time.Time
 
 	// 回调自动捕获字段
 	CallbackCode   string    // 回调收到的 authorization code
@@ -56,6 +58,14 @@ type oauthExchangeResult struct {
 	Email    string `json:"email,omitempty"`
 	PlanType string `json:"plan_type,omitempty"`
 	Error    string `json:"error,omitempty"`
+}
+
+type oauthCodeExchangeRequest struct {
+	SessionID string `json:"session_id"`
+	Code      string `json:"code"`
+	State     string `json:"state"`
+	Name      string `json:"name"`
+	ProxyURL  string `json:"proxy_url"`
 }
 
 type oauthSessionStore struct {
@@ -138,10 +148,20 @@ func oauthCodeChallenge(verifier string) string {
 // POST /api/admin/oauth/generate-auth-url
 func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 	var req struct {
-		ProxyURL    string `json:"proxy_url"`
-		RedirectURI string `json:"redirect_uri"`
+		ProxyURL             string `json:"proxy_url"`
+		RedirectURI          string `json:"redirect_uri"`
+		ReauthorizeAccountID int64  `json:"reauthorize_account_id"`
 	}
 	_ = c.ShouldBindJSON(&req)
+
+	if req.ReauthorizeAccountID < 0 {
+		writeError(c, http.StatusBadRequest, "无效的重新授权账号 ID")
+		return
+	}
+	if req.ReauthorizeAccountID > 0 && h.store.FindByID(req.ReauthorizeAccountID) == nil {
+		writeError(c, http.StatusNotFound, "重新授权账号不存在")
+		return
+	}
 
 	redirectURI := strings.TrimSpace(req.RedirectURI)
 	if redirectURI == "" {
@@ -167,11 +187,12 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 	}
 
 	globalOAuthStore.set(sessionID, &oauthSession{
-		State:        state,
-		CodeVerifier: codeVerifier,
-		RedirectURI:  redirectURI,
-		ProxyURL:     strings.TrimSpace(req.ProxyURL),
-		CreatedAt:    time.Now(),
+		State:                state,
+		CodeVerifier:         codeVerifier,
+		RedirectURI:          redirectURI,
+		ProxyURL:             strings.TrimSpace(req.ProxyURL),
+		ReauthorizeAccountID: req.ReauthorizeAccountID,
+		CreatedAt:            time.Now(),
 	})
 
 	params := neturl.Values{}
@@ -194,13 +215,7 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 // ExchangeOAuthCode 用授权码兑换 token，并写入新账号
 // POST /api/admin/oauth/exchange-code
 func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
-	var req struct {
-		SessionID string `json:"session_id"`
-		Code      string `json:"code"`
-		State     string `json:"state"`
-		Name      string `json:"name"`
-		ProxyURL  string `json:"proxy_url"`
-	}
+	var req oauthCodeExchangeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
@@ -299,6 +314,123 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 	})
 }
 
+// ReauthorizeOAuthAccount 用授权码重新授权现有账号，并同步更新 credentials
+// POST /api/admin/accounts/:id/oauth/reauthorize
+func (h *Handler) ReauthorizeOAuthAccount(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	if h.store.FindByID(id) == nil {
+		writeError(c, http.StatusNotFound, "账号不存在")
+		return
+	}
+
+	var req oauthCodeExchangeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if req.SessionID == "" || req.Code == "" || req.State == "" {
+		writeError(c, http.StatusBadRequest, "session_id、code 和 state 均为必填")
+		return
+	}
+
+	sess, ok := globalOAuthStore.get(req.SessionID)
+	if !ok {
+		writeError(c, http.StatusBadRequest, "OAuth 会话不存在或已过期（有效期 30 分钟）")
+		return
+	}
+	if req.State != sess.State {
+		writeError(c, http.StatusBadRequest, "state 不匹配，请重新发起授权")
+		return
+	}
+
+	email, planType, err := h.completeOAuthReauthorize(c.Request.Context(), id, req.SessionID, sess, req.Code, req.ProxyURL)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	globalOAuthStore.delete(req.SessionID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":   fmt.Sprintf("OAuth 账号 %d 重新授权成功", id),
+		"id":        id,
+		"email":     email,
+		"plan_type": planType,
+	})
+}
+
+func (h *Handler) completeOAuthReauthorize(ctx context.Context, id int64, sessionID string, sess *oauthSession, code string, proxyOverride string) (string, string, error) {
+	acc := h.store.FindByID(id)
+	if acc == nil {
+		return "", "", fmt.Errorf("账号不存在")
+	}
+
+	proxyURL := sess.ProxyURL
+	if trimmed := strings.TrimSpace(proxyOverride); trimmed != "" {
+		proxyURL = trimmed
+	}
+	if proxyURL == "" {
+		acc.Mu().RLock()
+		proxyURL = acc.ProxyURL
+		acc.Mu().RUnlock()
+	}
+	if proxyURL == "" {
+		proxyURL = h.store.GetProxyURL()
+	}
+
+	resinAccountID := fmt.Sprintf("%d", id)
+	tokenResp, accountInfo, err := doOAuthCodeExchange(ctx, code, sess.CodeVerifier, sess.RedirectURI, proxyURL, resinAccountID)
+	if err != nil {
+		return "", "", fmt.Errorf("授权码兑换失败: %w", err)
+	}
+
+	if tokenResp.RefreshToken == "" {
+		return "", "", fmt.Errorf("授权服务器未返回 refresh_token，请确认已开启 offline_access scope")
+	}
+	seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
+		refreshToken: tokenResp.RefreshToken,
+		accessToken:  tokenResp.AccessToken,
+		idToken:      tokenResp.IDToken,
+		expiresIn:    tokenResp.ExpiresIn,
+	})
+
+	writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	if err := h.store.ApplyOAuthCredentials(writeCtx, acc, auth.OAuthCredentialsUpdate{
+		RefreshToken: seed.refreshToken,
+		SessionToken: seed.sessionToken,
+		AccessToken:  seed.accessToken,
+		IDToken:      seed.idToken,
+		ExpiresAt:    seed.expiresAt,
+		AccountID:    seed.accountID,
+		Email:        seed.email,
+		PlanType:     seed.planType,
+		ProxyURL:     proxyURL,
+	}); err != nil {
+		return "", "", fmt.Errorf("Token 写入数据库失败: %w", err)
+	}
+
+	email := ""
+	planType := ""
+	if accountInfo != nil {
+		email = accountInfo.Email
+		planType = accountInfo.PlanType
+	}
+	if email == "" {
+		email = seed.email
+	}
+	if planType == "" {
+		planType = seed.planType
+	}
+
+	h.db.InsertAccountEventAsync(id, "reauthorized", "oauth")
+	return email, planType, nil
+}
+
 // ==================== 内部 HTTP 调用 ====================
 
 type rawOAuthTokenResp struct {
@@ -392,6 +524,27 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	sess.CallbackCode = code
 	sess.CallbackState = state
 	sess.CallbackAt = time.Now()
+
+	if sess.ReauthorizeAccountID > 0 {
+		email, planType, err := h.completeOAuthReauthorize(c.Request.Context(), sess.ReauthorizeAccountID, sessionID, sess, code, "")
+		if err != nil {
+			sess.ExchangeResult = &oauthExchangeResult{
+				Success: false,
+				Error:   err.Error(),
+			}
+			c.String(http.StatusOK, oauthCallbackPage("授权失败", "重新授权失败: "+err.Error(), false))
+			return
+		}
+		sess.ExchangeResult = &oauthExchangeResult{
+			Success:  true,
+			Message:  fmt.Sprintf("账号 %d 重新授权成功", sess.ReauthorizeAccountID),
+			ID:       sess.ReauthorizeAccountID,
+			Email:    email,
+			PlanType: planType,
+		}
+		c.String(http.StatusOK, oauthCallbackPage("授权成功", fmt.Sprintf("账号 %d 已重新授权，可以关闭此页面。", sess.ReauthorizeAccountID), true))
+		return
+	}
 
 	// 执行 code exchange（Resin 临时身份）
 	proxyURL := sess.ProxyURL

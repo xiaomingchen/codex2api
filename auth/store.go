@@ -3798,6 +3798,130 @@ func normalizeAccountErrorMessage(errorMsg string, fallback string) string {
 	return errorMsg
 }
 
+// OAuthCredentialsUpdate 表示一次 OAuth 重新授权写回的数据。
+type OAuthCredentialsUpdate struct {
+	RefreshToken string
+	SessionToken string
+	AccessToken  string
+	IDToken      string
+	ExpiresAt    time.Time
+	AccountID    string
+	Email        string
+	PlanType     string
+	ProxyURL     string
+}
+
+// ApplyOAuthCredentials 原子更新账号的 OAuth 凭据，并同步刷新运行时调度状态。
+func (s *Store) ApplyOAuthCredentials(ctx context.Context, acc *Account, update OAuthCredentialsUpdate) error {
+	if s == nil || acc == nil {
+		return fmt.Errorf("账号不存在")
+	}
+	if s.db == nil {
+		return fmt.Errorf("数据库不可用")
+	}
+
+	update.RefreshToken = strings.TrimSpace(update.RefreshToken)
+	update.SessionToken = strings.TrimSpace(update.SessionToken)
+	update.AccessToken = strings.TrimSpace(update.AccessToken)
+	update.IDToken = strings.TrimSpace(update.IDToken)
+	update.AccountID = strings.TrimSpace(update.AccountID)
+	update.Email = strings.TrimSpace(update.Email)
+	update.PlanType = strings.TrimSpace(update.PlanType)
+	update.ProxyURL = strings.TrimSpace(update.ProxyURL)
+
+	credentials := make(map[string]interface{}, 8)
+	if update.RefreshToken != "" {
+		credentials["refresh_token"] = update.RefreshToken
+	}
+	if update.SessionToken != "" {
+		credentials["session_token"] = update.SessionToken
+	}
+	if update.AccessToken != "" {
+		credentials["access_token"] = update.AccessToken
+	}
+	if update.IDToken != "" {
+		credentials["id_token"] = update.IDToken
+	}
+	if !update.ExpiresAt.IsZero() {
+		credentials["expires_at"] = update.ExpiresAt.Format(time.RFC3339)
+	}
+	if update.AccountID != "" {
+		credentials["account_id"] = update.AccountID
+	}
+	if update.Email != "" {
+		credentials["email"] = update.Email
+	}
+	if update.PlanType != "" {
+		credentials["plan_type"] = update.PlanType
+	}
+	if err := s.db.UpdateCredentials(ctx, acc.DBID, credentials); err != nil {
+		return err
+	}
+	if update.ProxyURL != "" {
+		if err := s.db.UpdateProxyURL(ctx, acc.DBID, update.ProxyURL); err != nil {
+			return err
+		}
+	}
+
+	if s.tokenCache != nil && update.AccessToken != "" && !update.ExpiresAt.IsZero() {
+		if ttl := time.Until(update.ExpiresAt) - 5*time.Minute; ttl > 0 {
+			_ = s.tokenCache.SetAccessToken(ctx, acc.DBID, update.AccessToken, ttl)
+		}
+	}
+
+	atomic.StoreInt32(&acc.Disabled, 0)
+	acc.mu.Lock()
+	if update.RefreshToken != "" {
+		acc.RefreshToken = update.RefreshToken
+	}
+	if update.SessionToken != "" {
+		acc.SessionToken = update.SessionToken
+	}
+	if update.AccessToken != "" {
+		acc.AccessToken = update.AccessToken
+	}
+	if !update.ExpiresAt.IsZero() {
+		acc.ExpiresAt = update.ExpiresAt
+	}
+	if update.AccountID != "" {
+		acc.AccountID = update.AccountID
+	}
+	if update.Email != "" {
+		acc.Email = update.Email
+	}
+	if update.PlanType != "" {
+		acc.PlanType = update.PlanType
+	}
+	if update.ProxyURL != "" {
+		acc.ProxyURL = update.ProxyURL
+	}
+	acc.Status = StatusReady
+	acc.ErrorMsg = ""
+	acc.CooldownUtil = time.Time{}
+	acc.CooldownReason = ""
+	acc.HealthTier = HealthTierWarm
+	acc.LastUnauthorizedAt = time.Time{}
+	acc.LastRateLimitedAt = time.Time{}
+	acc.LastTimeoutAt = time.Time{}
+	acc.LastServerErrorAt = time.Time{}
+	acc.LastFailureAt = time.Time{}
+	acc.FailureStreak = 0
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	s.deleteCachedAccountCooldown(acc.DBID)
+
+	clearCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.ClearCooldown(clearCtx, acc.DBID); err != nil {
+		log.Printf("[账号 %d] 清理冷却状态失败: %v", acc.DBID, err)
+	}
+	if err := s.db.ClearError(clearCtx, acc.DBID); err != nil {
+		log.Printf("[账号 %d] 清理错误状态失败: %v", acc.DBID, err)
+	}
+	return nil
+}
+
 // MarkCooldown 标记账号进入冷却，并持久化到数据库
 func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string) {
 	s.markCooldown(acc, duration, reason, "")

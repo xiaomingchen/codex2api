@@ -28,6 +28,8 @@ import type {
   ModelsResponse,
   OAuthExchangeResponse,
   OAuthURLResponse,
+  OAuthReauthorizeRequest,
+  OAuthReauthorizeResponse,
   OpsErrorSummary,
   OpsOverviewResponse,
   PromptFilterLogsResponse,
@@ -511,10 +513,12 @@ export const api = {
   testProxy: (url: string, id?: number, lang?: string) =>
     request<ProxyTestResult>('/proxies/test', { method: 'POST', body: JSON.stringify({ url, id, lang }) }),
   // OAuth
-  generateOAuthURL: (data: { proxy_url?: string; redirect_uri?: string }) =>
+  generateOAuthURL: (data: { proxy_url?: string; redirect_uri?: string; reauthorize_account_id?: number }) =>
     request<OAuthURLResponse>('/oauth/generate-auth-url', { method: 'POST', body: JSON.stringify(data) }),
   exchangeOAuthCode: (data: { session_id: string; code: string; state: string; name?: string; proxy_url?: string }) =>
     request<OAuthExchangeResponse>('/oauth/exchange-code', { method: 'POST', body: JSON.stringify(data) }),
+  reauthorizeOAuthAccount: (id: number, data: OAuthReauthorizeRequest) =>
+    request<OAuthReauthorizeResponse>(`/accounts/${id}/oauth/reauthorize`, { method: 'POST', body: JSON.stringify(data) }),
 }
 
 export interface ProxyRow {

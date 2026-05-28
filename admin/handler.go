@@ -304,6 +304,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	// OAuth 授权流程
 	api.POST("/oauth/generate-auth-url", h.GenerateOAuthURL)
 	api.POST("/oauth/exchange-code", h.ExchangeOAuthCode)
+	api.POST("/accounts/:id/oauth/reauthorize", h.ReauthorizeOAuthAccount)
 	api.GET("/oauth/poll-callback", h.PollOAuthCallback)
 
 	// OAuth 回调端点（无需 admin 鉴权，供 OpenAI 重定向调用）

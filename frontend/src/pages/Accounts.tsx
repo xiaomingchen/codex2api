@@ -535,6 +535,9 @@ export default function Accounts() {
     session_id: string;
     auth_url: string;
   } | null>(null);
+  const [oauthMode, setOauthMode] = useState<"add" | "reauthorize">("add");
+  const [oauthTargetAccount, setOauthTargetAccount] =
+    useState<AccountRow | null>(null);
   const [oauthProxyUrl, setOauthProxyUrl] = useState("");
   const [oauthCallbackUrl, setOauthCallbackUrl] = useState("");
   const [oauthName, setOauthName] = useState("");
@@ -1237,7 +1240,13 @@ export default function Accounts() {
   const handleOAuthGenerate = async () => {
     setOauthGenerating(true);
     try {
-      const result = await api.generateOAuthURL({ proxy_url: oauthProxyUrl });
+      const result = await api.generateOAuthURL({
+        proxy_url: oauthProxyUrl,
+        reauthorize_account_id:
+          oauthMode === "reauthorize" && oauthTargetAccount
+            ? oauthTargetAccount.id
+            : undefined,
+      });
       setOauthSession(result);
       setOauthStep("exchange");
     } catch (error) {
@@ -1271,33 +1280,74 @@ export default function Accounts() {
     }
     setOauthCompleting(true);
     try {
-      const result = await api.exchangeOAuthCode({
-        session_id: oauthSession.session_id,
-        code,
-        state,
-        name: oauthName.trim() || undefined,
-        proxy_url: oauthProxyUrl.trim() || undefined,
-      });
+      const proxyUrl = oauthProxyUrl.trim() || undefined;
+      const result =
+        oauthMode === "reauthorize" && oauthTargetAccount
+          ? await api.reauthorizeOAuthAccount(oauthTargetAccount.id, {
+              session_id: oauthSession.session_id,
+              code,
+              state,
+              proxy_url: proxyUrl,
+            })
+          : await api.exchangeOAuthCode({
+              session_id: oauthSession.session_id,
+              code,
+              state,
+              name: oauthName.trim() || undefined,
+              proxy_url: proxyUrl,
+            });
       showToast(
         result.email
-          ? t("accounts.oauthSuccess", { email: result.email })
-          : t("accounts.oauthSuccessNoEmail"),
+          ? oauthMode === "reauthorize"
+            ? t("accounts.oauthReauthSuccess", { email: result.email })
+            : t("accounts.oauthSuccess", { email: result.email })
+          : oauthMode === "reauthorize"
+            ? t("accounts.oauthReauthSuccessNoEmail")
+            : t("accounts.oauthSuccessNoEmail"),
       );
       setShowAdd(false);
       setAddMethod("rt");
       setOauthStep("generate");
+      setOauthMode("add");
+      setOauthTargetAccount(null);
       setOauthSession(null);
       setOauthCallbackUrl("");
       setOauthName("");
       void reload();
     } catch (error) {
       showToast(
-        t("accounts.oauthFailed", { error: getErrorMessage(error) }),
+        oauthMode === "reauthorize"
+          ? t("accounts.oauthReauthFailed", { error: getErrorMessage(error) })
+          : t("accounts.oauthFailed", { error: getErrorMessage(error) }),
         "error",
       );
     } finally {
       setOauthCompleting(false);
     }
+  };
+
+  const openAddAccountModal = () => {
+    setOauthMode("add");
+    setOauthTargetAccount(null);
+    setAddMethod("rt");
+    setOauthStep("generate");
+    setOauthSession(null);
+    setOauthCallbackUrl("");
+    setOauthName("");
+    setOauthProxyUrl("");
+    setShowAdd(true);
+  };
+
+  const openOAuthModalForReauthorize = (account: AccountRow) => {
+    setOauthMode("reauthorize");
+    setOauthTargetAccount(account);
+    setAddMethod("oauth");
+    setOauthStep("generate");
+    setOauthSession(null);
+    setOauthCallbackUrl("");
+    setOauthName("");
+    setOauthProxyUrl(account.proxy_url || "");
+    setShowAdd(true);
   };
 
   const readImportSSE = async (res: Response) => {
@@ -2572,7 +2622,7 @@ export default function Accounts() {
                     },
                   ]}
                 />
-                <Button onClick={() => setShowAdd(true)}>
+                <Button onClick={() => openAddAccountModal()}>
                   <Plus className="size-3.5" />
                   {t("accounts.addAccount")}
                 </Button>
@@ -3033,7 +3083,7 @@ export default function Accounts() {
                 emptyTitle={t("accounts.noData")}
                 emptyDescription={t("accounts.noDataDesc")}
                 action={
-                  <Button onClick={() => setShowAdd(true)}>
+                  <Button onClick={() => openAddAccountModal()}>
                     {t("accounts.addAccount")}
                   </Button>
                 }
@@ -3526,6 +3576,21 @@ export default function Accounts() {
                                     size="icon"
                                     className="h-7 w-8 px-0"
                                     disabled={
+                                      account.at_only ||
+                                      account.openai_responses_api
+                                    }
+                                    onClick={() =>
+                                      openOAuthModalForReauthorize(account)
+                                    }
+                                    title={t("accounts.reauthorize")}
+                                  >
+                                    <KeyRound className="size-3.5" />
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    size="icon"
+                                    className="h-7 w-8 px-0"
+                                    disabled={
                                       authJsonExportingIds.has(account.id) ||
                                       account.at_only ||
                                       account.openai_responses_api
@@ -3634,15 +3699,22 @@ export default function Accounts() {
 
           <Modal
             show={showAdd}
-            title={t("accounts.addTitle")}
+            title={
+              oauthMode === "reauthorize" && oauthTargetAccount
+                ? t("accounts.oauthReauthorizeTitle")
+                : t("accounts.addTitle")
+            }
             contentClassName="sm:max-w-[780px]"
             onClose={() => {
               setShowAdd(false);
               setAddMethod("rt");
               setOauthStep("generate");
+              setOauthMode("add");
+              setOauthTargetAccount(null);
               setOauthSession(null);
               setOauthCallbackUrl("");
               setOauthName("");
+              setOauthProxyUrl("");
               setOpenAIForm({
                 base_url: "https://api.openai.com",
                 api_key: "",
@@ -3659,9 +3731,12 @@ export default function Accounts() {
                     setShowAdd(false);
                     setAddMethod("rt");
                     setOauthStep("generate");
+                    setOauthMode("add");
+                    setOauthTargetAccount(null);
                     setOauthSession(null);
                     setOauthCallbackUrl("");
                     setOauthName("");
+                    setOauthProxyUrl("");
                     setOpenAIForm({
                       base_url: "https://api.openai.com",
                       api_key: "",
@@ -3673,28 +3748,28 @@ export default function Accounts() {
                 >
                   {t("common.cancel")}
                 </Button>
-                {addMethod === "rt" ? (
+                {oauthMode !== "reauthorize" && addMethod === "rt" ? (
                   <Button
                     onClick={() => void handleAdd()}
                     disabled={submitting || !addForm.refresh_token?.trim()}
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
-                ) : addMethod === "st" ? (
+                ) : oauthMode !== "reauthorize" && addMethod === "st" ? (
                   <Button
                     onClick={() => void handleAdd("st")}
                     disabled={submitting || !addForm.session_token?.trim()}
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
-                ) : addMethod === "at" ? (
+                ) : oauthMode !== "reauthorize" && addMethod === "at" ? (
                   <Button
                     onClick={() => void handleAddAT()}
                     disabled={submitting || !atForm.access_token.trim()}
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
-                ) : addMethod === "openai" ? (
+                ) : oauthMode !== "reauthorize" && addMethod === "openai" ? (
                   <Button
                     onClick={() => void handleAddOpenAIResponses()}
                     disabled={
@@ -3721,75 +3796,82 @@ export default function Accounts() {
                   >
                     {oauthCompleting
                       ? t("accounts.oauthCompleting")
-                      : t("accounts.oauthCompleteBtn")}
+                      : oauthMode === "reauthorize"
+                        ? t("accounts.oauthReauthCompleteBtn")
+                        : t("accounts.oauthCompleteBtn")}
                   </Button>
                 )}
               </>
             }
           >
             {/* Tab switcher */}
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
-              <button
-                onClick={() => setAddMethod("rt")}
-                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
-                  addMethod === "rt"
-                    ? "bg-background shadow-sm text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <RefreshCw className="size-3.5" />
-                {t("accounts.addMethodRT")}
-              </button>
-              <button
-                onClick={() => setAddMethod("st")}
-                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
-                  addMethod === "st"
-                    ? "bg-background shadow-sm text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <Cookie className="size-3.5" />
-                {t("accounts.addMethodSessionToken")}
-              </button>
-              <button
-                onClick={() => setAddMethod("at")}
-                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
-                  addMethod === "at"
-                    ? "bg-background shadow-sm text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <Fingerprint className="size-3.5" />
-                {t("accounts.addMethodAT")}
-              </button>
-              <button
-                onClick={() => setAddMethod("openai")}
-                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
-                  addMethod === "openai"
-                    ? "bg-background shadow-sm text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <KeyRound className="size-3.5" />
-                {t("accounts.addMethodOpenAI")}
-              </button>
-              <button
-                onClick={() => {
-                  setAddMethod("oauth");
-                  setOauthStep("generate");
-                  setOauthSession(null);
-                  setOauthCallbackUrl("");
-                }}
-                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
-                  addMethod === "oauth"
-                    ? "bg-background shadow-sm text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <KeyRound className="size-3.5" />
-                {t("accounts.addMethodOAuth")}
-              </button>
-            </div>
+            {oauthMode !== "reauthorize" && (
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
+                <button
+                  onClick={() => setAddMethod("rt")}
+                  className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                    addMethod === "rt"
+                      ? "bg-background shadow-sm text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <RefreshCw className="size-3.5" />
+                  {t("accounts.addMethodRT")}
+                </button>
+                <button
+                  onClick={() => setAddMethod("st")}
+                  className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                    addMethod === "st"
+                      ? "bg-background shadow-sm text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <Cookie className="size-3.5" />
+                  {t("accounts.addMethodSessionToken")}
+                </button>
+                <button
+                  onClick={() => setAddMethod("at")}
+                  className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                    addMethod === "at"
+                      ? "bg-background shadow-sm text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <Fingerprint className="size-3.5" />
+                  {t("accounts.addMethodAT")}
+                </button>
+                <button
+                  onClick={() => setAddMethod("openai")}
+                  className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                    addMethod === "openai"
+                      ? "bg-background shadow-sm text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <KeyRound className="size-3.5" />
+                  {t("accounts.addMethodOpenAI")}
+                </button>
+                <button
+                  onClick={() => {
+                    setAddMethod("oauth");
+                    setOauthStep("generate");
+                    setOauthMode("add");
+                    setOauthTargetAccount(null);
+                    setOauthSession(null);
+                    setOauthCallbackUrl("");
+                    setOauthProxyUrl("");
+                  }}
+                  className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                    addMethod === "oauth"
+                      ? "bg-background shadow-sm text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <KeyRound className="size-3.5" />
+                  {t("accounts.addMethodOAuth")}
+                </button>
+              </div>
+            )}
 
             {addMethod === "rt" ? (
               <div className="space-y-4">
@@ -4039,9 +4121,15 @@ export default function Accounts() {
                   <>
                     <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
                       <p className="font-semibold text-foreground mb-1">
-                        {t("accounts.oauthStep1Title")}
+                        {oauthMode === "reauthorize"
+                          ? t("accounts.oauthReauthorizeTitle")
+                          : t("accounts.oauthStep1Title")}
                       </p>
-                      <p>{t("accounts.oauthStep1Desc")}</p>
+                      <p>
+                        {oauthMode === "reauthorize" && oauthTargetAccount
+                          ? `${t("accounts.oauthStep1Desc")} ${formatAccountName(oauthTargetAccount)}`
+                          : t("accounts.oauthStep1Desc")}
+                      </p>
                     </div>
                     <div>
                       <label className="block mb-2 text-sm font-semibold text-muted-foreground">
@@ -4050,6 +4138,7 @@ export default function Accounts() {
                       <Input
                         placeholder={t("accounts.oauthNamePlaceholder")}
                         value={oauthName}
+                        disabled={oauthMode === "reauthorize"}
                         onChange={(e: ChangeEvent<HTMLInputElement>) =>
                           setOauthName(e.target.value)
                         }

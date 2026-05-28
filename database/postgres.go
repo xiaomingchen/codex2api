@@ -3727,6 +3727,13 @@ func (db *DB) UpdateCredentials(ctx context.Context, id int64, credentials map[s
 	return tx.Commit()
 }
 
+// UpdateProxyURL 更新账号的代理地址
+func (db *DB) UpdateProxyURL(ctx context.Context, id int64, proxyURL string) error {
+	query := `UPDATE accounts SET proxy_url = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+	_, err := db.conn.ExecContext(ctx, query, proxyURL, id)
+	return err
+}
+
 func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name string, credentials map[string]interface{}, proxyURL string) error {
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
