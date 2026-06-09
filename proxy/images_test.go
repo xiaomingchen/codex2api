@@ -1,12 +1,17 @@
 package proxy
 
 import (
+	"context"
 	"encoding/base64"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
@@ -40,6 +45,56 @@ func TestBuildImagesResponsesRequestMatchesReferenceChain(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "input.0.content.0.text").String(); got != "draw a cat" {
 		t.Fatalf("prompt = %q, want draw a cat", got)
+	}
+}
+
+func TestResponsesBodyHasImageGenerationTool(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{"tool", []byte(`{"tools":[{"type":"image_generation","model":"gpt-image-2"}]}`), true},
+		{"object_choice", []byte(`{"tool_choice":{"type":"image_generation"}}`), true},
+		{"string_choice", []byte(`{"tool_choice":"image_generation"}`), true},
+		{"function_tool", []byte(`{"tools":[{"type":"function","name":"lookup"}]}`), false},
+		{"empty", []byte(`{}`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := responsesBodyHasImageGenerationTool(tc.body); got != tc.want {
+				t.Fatalf("responsesBodyHasImageGenerationTool() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResponsesBodyRequestsImageGenerationIgnoresDefaultInjectedTool(t *testing.T) {
+	prepared, _ := PrepareResponsesBody([]byte(`{"model":"gpt-5.5","input":"hello"}`))
+	if !responsesBodyHasImageGenerationTool(prepared) {
+		t.Fatalf("test setup expected prepared body to include default image tool: %s", prepared)
+	}
+	if responsesBodyRequestsImageGeneration(prepared) {
+		t.Fatalf("default injected image tool should not force HTTP image path: %s", prepared)
+	}
+}
+
+func TestResponsesBodyRequestsImageGenerationDetectsExplicitIntent(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"object_choice", []byte(`{"model":"gpt-5.5","tool_choice":{"type":"image_generation"}}`)},
+		{"string_choice", []byte(`{"model":"gpt-5.5","tool_choice":"image_generation"}`)},
+		{"image_model", []byte(`{"model":"gpt-image-2","prompt":"draw a cat"}`)},
+		{"top_level_option", []byte(`{"model":"gpt-5.5","input":"draw a cat","size":"1024x1024"}`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !responsesBodyRequestsImageGeneration(tc.body) {
+				t.Fatalf("responsesBodyRequestsImageGeneration() = false, want true for %s", tc.body)
+			}
+		})
 	}
 }
 
@@ -280,5 +335,72 @@ func TestCollectImagesResponseUsesUpstreamFailureMessage(t *testing.T) {
 	}
 	if got := err.Error(); !strings.Contains(got, "server_error") || !strings.Contains(got, "req-123") {
 		t.Fatalf("error = %q, want upstream code and request id", got)
+	}
+}
+
+func TestStartImageStreamKeepaliveStopsWhenWriterFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	writes := 0
+	wrote := make(chan struct{}, 1)
+	stop := startImageStreamKeepalive(ctx, time.Millisecond, func() bool {
+		mu.Lock()
+		writes++
+		mu.Unlock()
+		select {
+		case wrote <- struct{}{}:
+		default:
+		}
+		return false
+	})
+	defer stop()
+
+	select {
+	case <-wrote:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("keepalive did not write")
+	}
+	time.Sleep(10 * time.Millisecond)
+	mu.Lock()
+	finalWrites := writes
+	mu.Unlock()
+	if finalWrites != 1 {
+		t.Fatalf("keepalive kept writing after writer failure: got %d writes, want 1", finalWrites)
+	}
+}
+
+func TestStreamImagesResponseSendsConnectedComment(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := `data: {"type":"response.completed","response":{"created_at":1710000000,"usage":{"input_tokens":5,"output_tokens":9},"tool_usage":{"image_gen":{"images":1,"input_tokens":34,"output_tokens":1756}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","quality":"high","size":"1024x1024"}],"output":[{"type":"image_generation_call","result":"` + tinyPNGBase64 + `","revised_prompt":"draw a cat","output_format":"png"}]}}` + "\n\n"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest("POST", "/v1/images/generations", nil)
+	handler := &Handler{}
+
+	usage, imageCount, _, imageLogInfo, err := handler.streamImagesResponse(c, strings.NewReader(upstream), "b64_json", "image_generation", "gpt-image-2", time.Now())
+
+	if err != nil {
+		t.Fatalf("streamImagesResponse returned error: %v", err)
+	}
+	if imageCount != 1 {
+		t.Fatalf("imageCount = %d, want 1", imageCount)
+	}
+	if usage == nil || usage.InputTokens != 34 || usage.OutputTokens != 1756 {
+		t.Fatalf("usage = %#v, want image usage input=34 output=1756", usage)
+	}
+	if imageLogInfo.Count != 1 || imageLogInfo.Width != 1 || imageLogInfo.Height != 1 {
+		t.Fatalf("imageLogInfo = %#v, want one 1x1 image", imageLogInfo)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	body := recorder.Body.String()
+	if !strings.HasPrefix(body, imageStreamConnectedComment) {
+		t.Fatalf("stream body should start with connected comment, got %q", body)
+	}
+	if !strings.Contains(body, "event: image_generation.completed\n") {
+		t.Fatalf("stream body missing completed event: %q", body)
 	}
 }

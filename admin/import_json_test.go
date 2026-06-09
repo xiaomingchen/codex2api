@@ -2,13 +2,18 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -144,6 +149,29 @@ func TestParseImportJSONTokensSupportsSub2APINumericExpiresAt(t *testing.T) {
 	}
 	if tokens[0].expiresAt != "1779071020" {
 		t.Fatalf("expiresAt = %q, want numeric value preserved", tokens[0].expiresAt)
+	}
+}
+
+func TestConflictingImportChatGPTIDs(t *testing.T) {
+	tokens := []importToken{
+		{chatgptAccountID: "shared", refreshToken: "rt-1"},
+		{chatgptAccountID: "shared", refreshToken: "rt-2"},
+		{chatgptAccountID: "stable", refreshToken: "rt-3"},
+		{chatgptAccountID: "stable", refreshToken: "rt-3"},
+	}
+
+	conflicts := conflictingImportChatGPTIDs(tokens)
+	if !conflicts["shared"] {
+		t.Fatal("shared chatgpt_account_id should be marked conflicting")
+	}
+	if conflicts["stable"] {
+		t.Fatal("stable chatgpt_account_id should not be marked conflicting")
+	}
+	if got := reliableImportChatGPTID(tokens[0], conflicts); got != "" {
+		t.Fatalf("reliableImportChatGPTID(shared) = %q, want empty", got)
+	}
+	if got := reliableImportChatGPTID(tokens[2], conflicts); got != "stable" {
+		t.Fatalf("reliableImportChatGPTID(stable) = %q, want stable", got)
 	}
 }
 
@@ -357,6 +385,221 @@ func TestImportAccountsJSONRejectsInvalidJSONFile(t *testing.T) {
 	}
 	if got := payload["error"]; got != "文件 broken.json 不是有效的 JSON 格式" {
 		t.Fatalf("error = %q, want %q", got, "文件 broken.json 不是有效的 JSON 格式")
+	}
+}
+
+func TestImportAccountsCommonDoesNotCollapseConflictingChatGPTAccountID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{name: "sub2api-1", refreshToken: "rt-shared-id-1", accessToken: "at-shared-id-1", chatgptAccountID: "same-exported-id"},
+		{name: "sub2api-2", refreshToken: "rt-shared-id-2", accessToken: "at-shared-id-2", chatgptAccountID: "same-exported-id"},
+	}, "")
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("active rows = %d, want 2", len(rows))
+	}
+	for _, row := range rows {
+		if got := row.GetCredential("account_id"); got != "" {
+			t.Fatalf("account_id = %q, want empty for conflicting chatgpt_account_id", got)
+		}
+	}
+}
+
+func TestImportAccountsCommonTriggersUsageProbeForImportedAccountWithAccessToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	probed := make(chan int64, 1)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(_ context.Context, acc *auth.Account) error {
+			probed <- acc.DBID
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken: "rt-import-probe",
+		accessToken:  "at-import-probe",
+	}}, "")
+
+	select {
+	case id := <-probed:
+		if id == 0 {
+			t.Fatal("probed account id is zero")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered for imported account with access token")
+	}
+}
+
+func TestImportAccountsCommonMarksImported7dUsageAsRateLimited(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	resetAt := time.Now().Add(6 * time.Hour).UTC().Truncate(time.Second)
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken:       "rt-import-limited",
+		accessToken:        "at-import-limited",
+		planType:           "team",
+		codex7DUsedPercent: "100",
+		codex7DResetAt:     resetAt.Format(time.RFC3339),
+	}}, "")
+
+	accounts := store.Accounts()
+	if len(accounts) != 1 {
+		t.Fatalf("store accounts = %d, want 1", len(accounts))
+	}
+	account := accounts[0]
+	if got := account.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
+	}
+	reason, until := account.GetCooldownSnapshot()
+	if reason != "rate_limited" || !until.After(time.Now()) {
+		t.Fatalf("cooldown = (%q, %s), want active rate_limited", reason, until)
+	}
+
+	row, err := db.GetAccountByID(context.Background(), account.DBID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if row.CooldownReason != "rate_limited" || !row.CooldownUntil.Valid {
+		t.Fatalf("persisted cooldown = (%q, %v), want active rate_limited", row.CooldownReason, row.CooldownUntil)
+	}
+}
+
+func TestImportAccountsCommonRefreshesAndProbesRTOnlyImport(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	probed := make(chan int64, 1)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		refreshAccount: func(_ context.Context, id int64) error {
+			acc := store.FindByID(id)
+			if acc == nil {
+				return fmt.Errorf("account %d not found", id)
+			}
+			acc.Mu().Lock()
+			acc.AccessToken = "at-refreshed"
+			acc.Mu().Unlock()
+			return nil
+		},
+		probeUsage: func(_ context.Context, acc *auth.Account) error {
+			probed <- acc.DBID
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{refreshToken: "rt-import-refresh-probe"}}, "")
+
+	select {
+	case id := <-probed:
+		if id == 0 {
+			t.Fatal("probed account id is zero")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered after RT-only import refresh")
+	}
+}
+
+func TestAddAccountStreamReportsProgressAndProbesAfterRefresh(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	probed := make(chan int64, 2)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		refreshAccount: func(_ context.Context, id int64) error {
+			acc := store.FindByID(id)
+			if acc == nil {
+				return fmt.Errorf("account %d not found", id)
+			}
+			acc.Mu().Lock()
+			acc.AccessToken = fmt.Sprintf("at-%d", id)
+			acc.Mu().Unlock()
+			return nil
+		},
+		probeUsage: func(_ context.Context, acc *auth.Account) error {
+			probed <- acc.DBID
+			return nil
+		},
+	}
+
+	body := bytes.NewBufferString(`{"refresh_token":"rt-stream-1\nrt-stream-2"}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts?stream=true", body)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.AddAccount(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	payload := recorder.Body.String()
+	if !strings.Contains(payload, `"type":"complete"`) || !strings.Contains(payload, `"success":2`) {
+		t.Fatalf("SSE payload = %q, want complete success=2", payload)
+	}
+
+	seen := map[int64]bool{}
+	deadline := time.After(2 * time.Second)
+	for len(seen) < 2 {
+		select {
+		case id := <-probed:
+			seen[id] = true
+		case <-deadline:
+			t.Fatalf("usage probes = %v, want 2 accounts probed", seen)
+		}
 	}
 }
 

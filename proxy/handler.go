@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -72,7 +73,20 @@ func (h *Handler) withModelCooldownFilter(model string, filter auth.AccountFilte
 }
 
 func (h *Handler) shouldUseWebsocketForHTTP() bool {
-	if h == nil || h.cfg == nil {
+	if h == nil {
+		return false
+	}
+	// 运行时 DB 级开关 codex_force_websocket 优先：开启则强制走 WS
+	// （与 ExecuteRequest 的 wantWebsocket 判定保持一致，也用于 usage 日志的 WS 标记）。
+	if CurrentRuntimeSettings().CodexForceWebsocket {
+		return true
+	}
+	// 管理后台的热更新值同样作为强制开关来源，避免运行时配置尚未同步时
+	// UI 显示已开启但请求热路径仍按静态 env=http 判定。
+	if h.store != nil && h.store.CodexForceWebsocket() {
+		return true
+	}
+	if h.cfg == nil {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(h.cfg.CodexUpstreamTransport)) {
@@ -105,6 +119,7 @@ type usageLimitDetails struct {
 type CodexUsageSyncResult struct {
 	UsagePct7d           float64
 	HasUsage7d           bool
+	Usage7dRateLimited   bool
 	UsagePct5h           float64
 	Reset5hAt            time.Time
 	HasUsage5h           bool
@@ -171,6 +186,15 @@ func isProOnlyModel(model string) bool {
 	return strings.EqualFold(strings.TrimSpace(model), proOnlySparkModel)
 }
 
+func isSparkPlanCandidate(planType string) bool {
+	switch auth.NormalizePlanType(planType) {
+	case "free", "api":
+		return false
+	default:
+		return true
+	}
+}
+
 func accountFilterForModel(model string) auth.AccountFilter {
 	model = strings.TrimSpace(model)
 	return func(account *auth.Account) bool {
@@ -184,7 +208,7 @@ func accountFilterForModel(model string) auth.AccountFilter {
 			return false
 		}
 		if isProOnlyModel(model) {
-			return auth.NormalizePlanType(account.GetPlanType()) == "pro"
+			return isSparkPlanCandidate(account.GetPlanType())
 		}
 		// 如果账号配置了模型列表，只允许列表中的模型通过
 		if model != "" && len(account.Models) > 0 {
@@ -234,7 +258,7 @@ func effectiveRequestModel(body []byte, fallback string) string {
 
 func noAvailableAccountMessage(model string) string {
 	if isProOnlyModel(model) {
-		return "无可用 Pro 账号，gpt-5.3-codex-spark 仅支持 Pro 订阅账号"
+		return "无可用付费或未知套餐账号，gpt-5.3-codex-spark 已排除明确 free/api 账号"
 	}
 	return "无可用账号，请稍后重试"
 }
@@ -286,6 +310,7 @@ func usageLogErrorMessage(statusCode int, body []byte) string {
 	typeCandidates := []string{
 		gjson.GetBytes(body, "error.type").String(),
 		gjson.GetBytes(body, "response.error.type").String(),
+		gjson.GetBytes(body, "response.status_details.error.type").String(),
 		gjson.GetBytes(body, "type").String(),
 	}
 	errType := ""
@@ -317,7 +342,7 @@ func usageLogErrorMessage(statusCode int, body []byte) string {
 
 func noAvailableAnthropicAccountMessage(model string) string {
 	if isProOnlyModel(model) {
-		return "No available Pro account for gpt-5.3-codex-spark"
+		return "No available paid or unknown-plan account for gpt-5.3-codex-spark"
 	}
 	return "No available accounts, please retry later"
 }
@@ -518,7 +543,101 @@ func populateAPIKeyMetaFromContext(c *gin.Context, input *database.UsageLogInput
 
 func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInput) {
 	populateAPIKeyMetaFromContext(c, input)
+	populateClientIPFromRequest(c, input)
+	populateCompactUsageMetaFromRequest(c, input)
 	h.logUsage(input)
+}
+
+func populateClientIPFromRequest(c *gin.Context, input *database.UsageLogInput) {
+	if c == nil || input == nil || strings.TrimSpace(input.ClientIP) != "" {
+		return
+	}
+	clientIP := strings.TrimSpace(c.ClientIP())
+	if clientIP == "" && c.Request != nil {
+		clientIP = strings.TrimSpace(c.Request.RemoteAddr)
+		if host, _, err := net.SplitHostPort(clientIP); err == nil {
+			clientIP = host
+		}
+	}
+	if len(clientIP) > 64 {
+		clientIP = clientIP[:64]
+	}
+	input.ClientIP = clientIP
+}
+
+func populateCompactUsageMetaFromRequest(c *gin.Context, input *database.UsageLogInput) {
+	if input == nil || input.Compact {
+		return
+	}
+	if isCompactUsageEndpoint(input.Endpoint) || isCompactUsageEndpoint(input.InboundEndpoint) || isCompactUsageEndpoint(input.UpstreamEndpoint) {
+		input.Compact = true
+		return
+	}
+	if c == nil {
+		return
+	}
+	if body, ok := rawRequestBodyFromContext(c); ok && requestBodyHasCompactionInput(body) {
+		input.Compact = true
+	}
+}
+
+func isCompactUsageEndpoint(endpoint string) bool {
+	endpoint = strings.TrimSpace(endpoint)
+	if cut := strings.IndexAny(endpoint, "?#"); cut >= 0 {
+		endpoint = endpoint[:cut]
+	}
+	endpoint = strings.TrimRight(endpoint, "/")
+	return endpoint == "/v1/responses/compact"
+}
+
+func rawRequestBodyFromContext(c *gin.Context) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+	v, exists := c.Get("raw_body")
+	if !exists || v == nil {
+		return nil, false
+	}
+	switch body := v.(type) {
+	case []byte:
+		if len(body) == 0 {
+			return nil, false
+		}
+		return body, true
+	case string:
+		if body == "" {
+			return nil, false
+		}
+		return []byte(body), true
+	default:
+		return nil, false
+	}
+}
+
+func requestBodyHasCompactionInput(body []byte) bool {
+	input := gjson.GetBytes(body, "input")
+	return gjsonResultHasCompactionInput(input)
+}
+
+func gjsonResultHasCompactionInput(result gjson.Result) bool {
+	if !result.Exists() {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(result.Get("type").String()), "compaction") {
+		return true
+	}
+	if !result.IsArray() && !result.IsObject() {
+		return false
+	}
+	found := false
+	result.ForEach(func(_, value gjson.Result) bool {
+		if gjsonResultHasCompactionInput(value) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // extractReasoningEffort 从请求体提取推理强度
@@ -543,11 +662,38 @@ func extractServiceTier(body []byte) string {
 	return gjson.GetBytes(body, "serviceTier").String()
 }
 
+const upstreamErrorKindMessageTooBig = "message_too_big"
+
+func isWebsocketMessageTooBigError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "message too big") || strings.Contains(msg, "close 1009")
+}
+
+func isWebsocketMessageTooBigOutcome(outcome streamOutcome) bool {
+	return outcome.failureKind == upstreamErrorKindMessageTooBig
+}
+
+func shouldFallbackWebsocketMessageTooBigToHTTP(outcome streamOutcome, useWebsocket bool, wroteAnyBody bool, ctxErr, writeErr error) bool {
+	if !useWebsocket || !isWebsocketMessageTooBigOutcome(outcome) {
+		return false
+	}
+	if wroteAnyBody || ctxErr != nil || writeErr != nil {
+		return false
+	}
+	return outcome.penalize
+}
+
 func classifyTransportFailure(err error) string {
 	if err == nil {
 		return ""
 	}
 
+	if isWebsocketMessageTooBigError(err) {
+		return upstreamErrorKindMessageTooBig
+	}
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
 		return "timeout"
@@ -641,6 +787,46 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 	}
 }
 
+func responseFailedErrorBody(payload []byte) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	if gjson.GetBytes(payload, "error").Exists() {
+		return payload
+	}
+	for _, path := range []string{
+		"response.error",
+		"response.status_details.error",
+	} {
+		result := gjson.GetBytes(payload, path)
+		raw := strings.TrimSpace(result.Raw)
+		if raw == "" || raw == "null" {
+			continue
+		}
+		return []byte(`{"error":` + raw + `}`)
+	}
+	return payload
+}
+
+// responseFailedRetryable 判断一个 response.failed 终止事件是否属于"换号重试有意义"的上游故障
+// （额度耗尽/限流/5xx/401）。用于在首包前透明换号，避免把可恢复的失败帧直接下发给
+// WebSocket 客户端而触发反复 Reconnecting。非可重试故障（如 invalid_request）仍照常透传。
+func responseFailedRetryable(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	return classifyResponseFailedOutcome(payload).penalize
+}
+
+func (h *Handler) applyResponseFailedCooldown(account *auth.Account, payload []byte, resp *http.Response, model string) codex429Decision {
+	if h == nil || account == nil || len(payload) == 0 {
+		return codex429Decision{}
+	}
+	body := responseFailedErrorBody(payload)
+	statusCode := responseFailedStatusCode(payload)
+	return h.applyCooldownForModel(account, statusCode, body, resp, model)
+}
+
 func responseFailedStatusCode(payload []byte) int {
 	for _, path := range []string{
 		"response.status_code",
@@ -664,6 +850,8 @@ func responseFailedStatusCode(payload []byte) int {
 		gjson.GetBytes(payload, "error.type").String(),
 	}, " "))
 	switch {
+	case strings.Contains(codeOrType, "usage_limit"):
+		return http.StatusTooManyRequests
 	case strings.Contains(codeOrType, "rate_limit"):
 		return http.StatusTooManyRequests
 	case strings.Contains(codeOrType, "unauthorized") || strings.Contains(codeOrType, "invalid_api_key"):
@@ -1078,6 +1266,12 @@ func upstreamAccountErrorMessage(statusCode int, body []byte) string {
 }
 
 func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) string {
+	if IsUsageLimitReachedError(body) {
+		if decision.Reason != "" {
+			return decision.Reason
+		}
+		return "usage_limit"
+	}
 	switch statusCode {
 	case http.StatusTooManyRequests:
 		if decision.Reason != "" {
@@ -1105,15 +1299,40 @@ func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
 	if len(body) == 0 {
 		return usageLimitDetails{}, false
 	}
-	if gjson.GetBytes(body, "error.type").String() != "usage_limit_reached" {
+	if !IsUsageLimitReachedError(body) {
 		return usageLimitDetails{}, false
 	}
 	return usageLimitDetails{
-		message:         gjson.GetBytes(body, "error.message").String(),
-		planType:        gjson.GetBytes(body, "error.plan_type").String(),
-		resetsAt:        gjson.GetBytes(body, "error.resets_at").Int(),
-		resetsInSeconds: gjson.GetBytes(body, "error.resets_in_seconds").Int(),
+		message:         firstGJSONString(body, "error.message", "response.error.message", "response.status_details.error.message"),
+		planType:        firstGJSONString(body, "error.plan_type", "response.error.plan_type", "response.status_details.error.plan_type"),
+		resetsAt:        firstGJSONInt(body, "error.resets_at", "response.error.resets_at", "response.status_details.error.resets_at"),
+		resetsInSeconds: firstGJSONInt(body, "error.resets_in_seconds", "response.error.resets_in_seconds", "response.status_details.error.resets_in_seconds"),
 	}, true
+}
+
+// IsUsageLimitReachedError reports whether an upstream error body represents
+// account quota exhaustion, even when the transport status is incorrectly 5xx.
+func IsUsageLimitReachedError(body []byte) bool {
+	return strings.EqualFold(firstGJSONString(body, "error.type", "response.error.type", "response.status_details.error.type"), "usage_limit_reached")
+}
+
+func firstGJSONString(body []byte, paths ...string) string {
+	for _, path := range paths {
+		if value := strings.TrimSpace(gjson.GetBytes(body, path).String()); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstGJSONInt(body []byte, paths ...string) int64 {
+	for _, path := range paths {
+		result := gjson.GetBytes(body, path)
+		if result.Exists() {
+			return result.Int()
+		}
+	}
+	return 0
 }
 
 // Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
@@ -1125,10 +1344,14 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 
+	supportedModels := h.supportedModelIDs(c.Request.Context())
+	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	c.Set("raw_body", rawBody)
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
-	rules := api.ResponsesAPIValidationRulesForModel(gjson.GetBytes(rawBody, "model").String())
-	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
+	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
+	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1143,7 +1366,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 
-	model := gjson.GetBytes(rawBody, "model").String()
+	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	logModel := requestModel
+	if logModel == "" {
+		logModel = model
+	}
 
 	// 验证 model 参数
 	if err := security.ValidateModelName(model); err != nil {
@@ -1168,12 +1395,13 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
+	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
-		c.Set("x-service-tier", serviceTier)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
 
 	// 2. 准备上游请求体（Unmarshal→map→Marshal，一次序列化）
@@ -1184,6 +1412,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
+	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
+	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
+		return
+	}
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
@@ -1195,6 +1427,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	forceHTTPAfterWSMessageTooBig := false
 	invalidEncryptedContentRetried := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
@@ -1220,7 +1453,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
-		useWebsocket := h.shouldUseWebsocketForHTTP()
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
+		if useWebsocket && responsesBodyRequestsImageGeneration(rawBody) {
+			useWebsocket = false
+		}
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -1327,25 +1563,31 @@ func (h *Handler) Responses(c *gin.Context) {
 				retryExclusions.MarkHard(account.ID())
 
 				log.Printf("OpenAI Responses 上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
-				logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
-				h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
+				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
+				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
-					AccountID:         account.ID(),
-					Endpoint:          "/v1/responses",
-					Model:             model,
-					StatusCode:        resp.StatusCode,
-					DurationMs:        durationMs,
-					ReasoningEffort:   reasoningEffort,
-					InboundEndpoint:   "/v1/responses",
-					UpstreamEndpoint:  upstreamEndpoint,
-					Stream:            isStream,
-					ServiceTier:       serviceTier,
-					IsRetryAttempt:    shouldRetry,
-					AttemptIndex:      attempt + 1,
-					UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-					ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       logEffectiveModel,
+					StatusCode:           resp.StatusCode,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					InboundEndpoint:      "/v1/responses",
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					ServiceTier:          usageTiers.ServiceTier,
+					RequestedServiceTier: usageTiers.RequestedServiceTier,
+					ActualServiceTier:    usageTiers.ActualServiceTier,
+					BillingServiceTier:   usageTiers.BillingServiceTier,
+					IsRetryAttempt:       shouldRetry,
+					AttemptIndex:         attempt + 1,
+					UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+					ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 				})
 
 				if shouldRetry {
@@ -1360,7 +1602,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			c.Set("x-account-email", baseURL)
 			c.Set("x-account-proxy", proxyURL)
-			c.Set("x-model", model)
+			c.Set("x-model", logModel)
 			c.Set("x-reasoning-effort", reasoningEffort)
 
 			var firstTokenMs int
@@ -1397,11 +1639,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
-					isFirstToken := isFirstTokenEvent(eventType)
+					ttftGuard.MarkProgress(eventType)
+					isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 					if !ttftRecorded && isFirstToken {
 						firstTokenMs = int(time.Since(start).Milliseconds())
 						ttftRecorded = true
-						ttftGuard.MarkEvent(eventType)
 					}
 					if eventType == "response.output_text.delta" {
 						deltaCharCount += len(parsed.Get("delta").String())
@@ -1417,12 +1659,12 @@ func (h *Handler) Responses(c *gin.Context) {
 						terminalFailurePayload = append([]byte(nil), data...)
 						gotTerminal = true
 					}
-					if image, ok := extractImageFromOutputItemDone(data, model); ok {
+					if image, ok := extractImageFromOutputItemDone(data, logModel); ok {
 						imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 					}
 					if !clientGone {
 						payload := fmt.Sprintf("data: %s\n\n", data)
-						shouldDefer := !ttftRecorded && !gotTerminal && !isFirstToken
+						shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
 						if shouldDefer {
 							pendingFirstTokenEvents.WriteString(payload)
 							if pendingFirstTokenEvents.Len() <= 1024*1024 {
@@ -1468,8 +1710,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 			}
 			ttftGuard.Stop()
+			var responseFailedDecision codex429Decision
 			if len(terminalFailurePayload) > 0 {
 				outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+				responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
+				if responseFailedDecision.Reason != "" {
+					outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
+				}
 			}
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
@@ -1504,22 +1751,25 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 
-			resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
-			billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
-			c.Set("x-service-tier", resolvedServiceTier)
+			usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
+			c.Set("x-service-tier", usageTiers.ServiceTier)
 			logInput := &database.UsageLogInput{
-				AccountID:          account.ID(),
-				Endpoint:           "/v1/responses",
-				Model:              model,
-				StatusCode:         outcome.logStatusCode,
-				DurationMs:         totalDuration,
-				FirstTokenMs:       firstTokenMs,
-				ReasoningEffort:    reasoningEffort,
-				InboundEndpoint:    "/v1/responses",
-				UpstreamEndpoint:   upstreamEndpoint,
-				Stream:             isStream,
-				ServiceTier:        resolvedServiceTier,
-				BillingServiceTier: billingServiceTier,
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				StatusCode:           outcome.logStatusCode,
+				DurationMs:           totalDuration,
+				FirstTokenMs:         firstTokenMs,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/responses",
+				UpstreamEndpoint:     upstreamEndpoint,
+				Stream:               isStream,
+				ViaWebsocket:         useWebsocket,
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
@@ -1551,6 +1801,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		if useWebsocket && explicitSessionID == "" {
+			upstreamSessionID = ""
+		}
 		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
 		// response.completed 拿到 usage（流式计费的关键）。
 		// lastUpstreamCancel 在 attempt loop 顶部声明 + defer 兜底，
@@ -1571,6 +1824,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
 			kind := classifyTransportFailure(reqErr)
+			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
+				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr)
+				forceHTTPAfterWSMessageTooBig = true
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				continue
+			}
 			retryable := IsRetryableError(reqErr) || kind != ""
 			shouldRetry := false
 			if retryable {
@@ -1638,25 +1898,31 @@ func (h *Handler) Responses(c *gin.Context) {
 			retryExclusions.MarkHard(account.ID())
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
-			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
+			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          "/v1/responses",
-				Model:             model,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				ReasoningEffort:   reasoningEffort,
-				InboundEndpoint:   "/v1/responses",
-				UpstreamEndpoint:  "/v1/responses",
-				Stream:            isStream,
-				ServiceTier:       serviceTier,
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				StatusCode:           resp.StatusCode,
+				DurationMs:           durationMs,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/responses",
+				UpstreamEndpoint:     "/v1/responses",
+				Stream:               isStream,
+				ViaWebsocket:         useWebsocket,
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
+				IsRetryAttempt:       shouldRetry,
+				AttemptIndex:         attempt + 1,
+				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -1669,12 +1935,14 @@ func (h *Handler) Responses(c *gin.Context) {
 			return
 		}
 
+		SyncCodexUsageState(h.store, account, resp)
+
 		// 成功！透传响应并跟踪 TTFT / usage
 		account.Mu().RLock()
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
-		c.Set("x-model", model)
+		c.Set("x-model", logModel)
 		c.Set("x-reasoning-effort", reasoningEffort)
 		var firstTokenMs int
 		var usage *UsageInfo
@@ -1716,19 +1984,19 @@ func (h *Handler) Responses(c *gin.Context) {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
-				// TTFT: 记录第一个 output_text.delta 事件的时间
-				isFirstToken := isFirstTokenEvent(eventType)
+				// TTFT: 记录第一个实际内容事件的时间
+				ttftGuard.MarkProgress(eventType)
+				isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
-					ttftGuard.MarkEvent(eventType)
 				}
 
 				// 累计 delta 字符数
 				if eventType == "response.output_text.delta" {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
-				if image, ok := extractImageFromOutputItemDone(data, model); ok {
+				if image, ok := extractImageFromOutputItemDone(data, logModel); ok {
 					imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 				}
 
@@ -1749,7 +2017,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 				if !clientGone {
 					payload := fmt.Sprintf("data: %s\n\n", data)
-					shouldDefer := !ttftRecorded && !gotTerminal && !isFirstToken
+					shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
 					if shouldDefer {
 						pendingFirstTokenEvents.WriteString(payload)
 						if pendingFirstTokenEvents.Len() <= 1024*1024 {
@@ -1789,10 +2057,10 @@ func (h *Handler) Responses(c *gin.Context) {
 				if imageOutput, ok := extractResponseImageGenerationOutput(data, seenImageOutputs); ok {
 					imageOutputs = append(imageOutputs, imageOutput)
 				}
-				if !ttftRecorded && isFirstTokenEvent(eventType) {
+				ttftGuard.MarkProgress(eventType)
+				if !ttftRecorded && isFirstTokenResultForMode(parsed, currentFirstTokenMode()) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
-					ttftGuard.MarkEvent(eventType)
 				}
 				// 累计 delta 字符数
 				if eventType == "response.output_text.delta" {
@@ -1836,13 +2104,25 @@ func (h *Handler) Responses(c *gin.Context) {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
 		ttftGuard.Stop()
+		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
+			if responseFailedDecision.Reason != "" {
+				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
+			}
+		}
+		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/responses): %s", attempt+1, account.ID(), outcome.failureMessage)
+			forceHTTPAfterWSMessageTooBig = true
+			resp.Body.Close()
+			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
-			SyncCodexUsageState(h.store, account, resp)
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 			} else {
@@ -1884,23 +2164,26 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 
-		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
-		billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
-		c.Set("x-service-tier", resolvedServiceTier)
+		usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
+		c.Set("x-service-tier", usageTiers.ServiceTier)
 
 		logInput := &database.UsageLogInput{
-			AccountID:          account.ID(),
-			Endpoint:           "/v1/responses",
-			Model:              model,
-			StatusCode:         logStatusCode,
-			DurationMs:         totalDuration,
-			FirstTokenMs:       firstTokenMs,
-			ReasoningEffort:    reasoningEffort,
-			InboundEndpoint:    "/v1/responses",
-			UpstreamEndpoint:   "/v1/responses",
-			Stream:             isStream,
-			ServiceTier:        resolvedServiceTier,
-			BillingServiceTier: billingServiceTier,
+			AccountID:            account.ID(),
+			Endpoint:             "/v1/responses",
+			Model:                logModel,
+			EffectiveModel:       logEffectiveModel,
+			StatusCode:           logStatusCode,
+			DurationMs:           totalDuration,
+			FirstTokenMs:         firstTokenMs,
+			ReasoningEffort:      reasoningEffort,
+			InboundEndpoint:      "/v1/responses",
+			UpstreamEndpoint:     "/v1/responses",
+			Stream:               isStream,
+			ViaWebsocket:         useWebsocket,
+			ServiceTier:          usageTiers.ServiceTier,
+			RequestedServiceTier: usageTiers.RequestedServiceTier,
+			ActualServiceTier:    usageTiers.ActualServiceTier,
+			BillingServiceTier:   usageTiers.BillingServiceTier,
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
@@ -1919,7 +2202,6 @@ func (h *Handler) Responses(c *gin.Context) {
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
-		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -1942,10 +2224,14 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 
+	supportedModels := h.supportedModelIDs(c.Request.Context())
+	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	c.Set("raw_body", rawBody)
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
-	rules := api.ResponsesAPIValidationRulesForModel(gjson.GetBytes(rawBody, "model").String())
-	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
+	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
+	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1959,7 +2245,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 
-	model := gjson.GetBytes(rawBody, "model").String()
+	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	logModel := requestModel
+	if logModel == "" {
+		logModel = model
+	}
 	if err := security.ValidateModelName(model); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": gin.H{"message": "model 参数无效", "type": "invalid_request_error"},
@@ -1989,7 +2279,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
-		c.Set("x-service-tier", serviceTier)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
 
 	// compact 强制非流式
@@ -2002,11 +2292,17 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
+	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
 		return
 	}
-	accountFilter := accountFilterForModel(effectiveModel)
+	// compact 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
+	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
+	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+
+	// compact 走中转账号时需要 OpenAI Responses 形态的请求体
+	openAIResponsesBody := PrepareOpenAIResponsesCompactBody(rawBody)
 
 	// 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -2044,6 +2340,151 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 		downstreamHeaders := c.Request.Header.Clone()
 
+		if account.IsOpenAIResponsesAPI() {
+			baseURL, _ := account.OpenAIResponsesCredentials()
+			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses/compact")
+			resp, reqErr := ExecuteOpenAIResponsesCompactRequest(c.Request.Context(), account, openAIResponsesBody, proxyURL, downstreamHeaders)
+			durationMs := int(time.Since(start).Milliseconds())
+
+			if reqErr != nil {
+				if kind := classifyTransportFailure(reqErr); kind != "" {
+					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				}
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				excludeAccounts[account.ID()] = true
+
+				if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+					ErrorToGinResponse(c, reqErr)
+					return
+				}
+
+				log.Printf("OpenAI Responses compact 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
+				if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+					continue
+				}
+				ErrorToGinResponse(c, reqErr)
+				return
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				errBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
+					strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+					if rawChanged || codexChanged {
+						invalidEncryptedContentRetried = true
+						if rawChanged {
+							rawBody = strippedRawBody
+							openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+						}
+						if codexChanged {
+							codexBody = strippedCodexBody
+						}
+						log.Printf("OpenAI Responses compact 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+						h.store.Release(account)
+						h.store.UnbindSessionAffinity(affinityKey, account.ID())
+						continue
+					}
+				}
+
+				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				}
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				excludeAccounts[account.ID()] = true
+
+				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
+				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
+				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				usageTiers := resolveUsageServiceTiers("", serviceTier)
+				h.logUsageForRequest(c, &database.UsageLogInput{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses/compact",
+					Model:                logModel,
+					EffectiveModel:       logEffectiveModel,
+					StatusCode:           resp.StatusCode,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					InboundEndpoint:      "/v1/responses/compact",
+					UpstreamEndpoint:     upstreamEndpoint,
+					ServiceTier:          usageTiers.ServiceTier,
+					RequestedServiceTier: usageTiers.RequestedServiceTier,
+					ActualServiceTier:    usageTiers.ActualServiceTier,
+					BillingServiceTier:   usageTiers.BillingServiceTier,
+					IsRetryAttempt:       shouldRetry,
+					AttemptIndex:         attempt + 1,
+					UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+					ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
+				})
+
+				if shouldRetry {
+					lastStatusCode = resp.StatusCode
+					lastBody = errBody
+					continue
+				}
+
+				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+				return
+			}
+
+			h.store.ClearModelCooldown(account, effectiveModel)
+			h.store.ReportRequestSuccess(account, time.Duration(durationMs)*time.Millisecond)
+
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			promptTokens := int(gjson.GetBytes(respBody, "usage.input_tokens").Int())
+			completionTokens := int(gjson.GetBytes(respBody, "usage.output_tokens").Int())
+			totalTokens := int(gjson.GetBytes(respBody, "usage.total_tokens").Int())
+			reasoningTokens := int(gjson.GetBytes(respBody, "usage.output_tokens_details.reasoning_tokens").Int())
+			cachedTokens := int(gjson.GetBytes(respBody, "usage.input_tokens_details.cached_tokens").Int())
+
+			actualServiceTier := gjson.GetBytes(respBody, "service_tier").String()
+			usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
+
+			c.Set("x-account-email", baseURL)
+			c.Set("x-account-proxy", proxyURL)
+			c.Set("x-model", logModel)
+			c.Set("x-reasoning-effort", reasoningEffort)
+			c.Set("x-service-tier", usageTiers.ServiceTier)
+
+			h.logUsageForRequest(c, &database.UsageLogInput{
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses/compact",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				StatusCode:           http.StatusOK,
+				DurationMs:           durationMs,
+				PromptTokens:         promptTokens,
+				CompletionTokens:     completionTokens,
+				TotalTokens:          totalTokens,
+				InputTokens:          promptTokens,
+				OutputTokens:         completionTokens,
+				ReasoningTokens:      reasoningTokens,
+				CachedTokens:         cachedTokens,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/responses/compact",
+				UpstreamEndpoint:     upstreamEndpoint,
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
+			})
+
+			h.store.Release(account)
+			contentType := resp.Header.Get("Content-Type")
+			if contentType == "" {
+				contentType = "application/json"
+			}
+			c.Data(http.StatusOK, contentType, respBody)
+			return
+		}
+
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
 		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
 		durationMs := int(time.Since(start).Milliseconds())
@@ -2080,6 +2521,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					invalidEncryptedContentRetried = true
 					if rawChanged {
 						rawBody = strippedRawBody
+						openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
 					}
 					if codexChanged {
 						codexBody = strippedCodexBody
@@ -2099,24 +2541,29 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
-			logUpstreamError("/v1/responses/compact", resp.StatusCode, model, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", model, errBody)
+			logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          "/v1/responses/compact",
-				Model:             model,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				ReasoningEffort:   reasoningEffort,
-				InboundEndpoint:   "/v1/responses/compact",
-				UpstreamEndpoint:  "/v1/responses/compact",
-				ServiceTier:       serviceTier,
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses/compact",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				StatusCode:           resp.StatusCode,
+				DurationMs:           durationMs,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/responses/compact",
+				UpstreamEndpoint:     "/v1/responses/compact",
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
+				IsRetryAttempt:       shouldRetry,
+				AttemptIndex:         attempt + 1,
+				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -2144,28 +2591,30 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		cachedTokens := int(gjson.GetBytes(respBody, "usage.input_tokens_details.cached_tokens").Int())
 
 		actualServiceTier := gjson.GetBytes(respBody, "service_tier").String()
-		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
-		billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
+		usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
 
 		totalDuration := int(time.Since(start).Milliseconds())
 		h.logUsageForRequest(c, &database.UsageLogInput{
-			AccountID:          account.ID(),
-			Endpoint:           "/v1/responses/compact",
-			Model:              model,
-			StatusCode:         http.StatusOK,
-			DurationMs:         totalDuration,
-			PromptTokens:       promptTokens,
-			CompletionTokens:   completionTokens,
-			TotalTokens:        totalTokens,
-			InputTokens:        promptTokens,
-			OutputTokens:       completionTokens,
-			ReasoningTokens:    reasoningTokens,
-			CachedTokens:       cachedTokens,
-			ReasoningEffort:    reasoningEffort,
-			InboundEndpoint:    "/v1/responses/compact",
-			UpstreamEndpoint:   "/v1/responses/compact",
-			ServiceTier:        resolvedServiceTier,
-			BillingServiceTier: billingServiceTier,
+			AccountID:            account.ID(),
+			Endpoint:             "/v1/responses/compact",
+			Model:                logModel,
+			EffectiveModel:       logEffectiveModel,
+			StatusCode:           http.StatusOK,
+			DurationMs:           totalDuration,
+			PromptTokens:         promptTokens,
+			CompletionTokens:     completionTokens,
+			TotalTokens:          totalTokens,
+			InputTokens:          promptTokens,
+			OutputTokens:         completionTokens,
+			ReasoningTokens:      reasoningTokens,
+			CachedTokens:         cachedTokens,
+			ReasoningEffort:      reasoningEffort,
+			InboundEndpoint:      "/v1/responses/compact",
+			UpstreamEndpoint:     "/v1/responses/compact",
+			ServiceTier:          usageTiers.ServiceTier,
+			RequestedServiceTier: usageTiers.RequestedServiceTier,
+			ActualServiceTier:    usageTiers.ActualServiceTier,
+			BillingServiceTier:   usageTiers.BillingServiceTier,
 		})
 
 		h.store.Release(account)
@@ -2182,10 +2631,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
+	supportedModels := h.supportedModelIDs(c.Request.Context())
+	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ChatCompletionValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
+	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -2200,9 +2652,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
-	model := gjson.GetBytes(rawBody, "model").String()
+	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	if mappedModel != "" {
+		model = mappedModel
+	}
+	logModel := requestModel
+	if logModel == "" {
+		logModel = model
+	}
+	responseModel := logModel
 	if model == "" {
 		model = "gpt-5.4"
+		logModel = model
+		responseModel = model
 	}
 	if isImageOnlyModel(model) {
 		sendImageOnlyModelError(c, model)
@@ -2224,7 +2686,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
-		c.Set("x-service-tier", serviceTier)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
 
 	// 2. 翻译请求：OpenAI Chat → Codex Responses
@@ -2234,6 +2696,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
+	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
 		return
 	}
@@ -2241,6 +2704,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
+	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 
@@ -2252,6 +2716,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	forceHTTPAfterWSMessageTooBig := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -2276,7 +2741,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
-		useWebsocket := h.shouldUseWebsocketForHTTP()
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
+		if useWebsocket && responsesBodyRequestsImageGeneration(codexBody) {
+			useWebsocket = false
+		}
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -2294,6 +2762,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		downstreamHeaders := c.Request.Header.Clone()
 
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		if useWebsocket && explicitSessionID == "" {
+			upstreamSessionID = ""
+		}
 		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
 		// response.completed 拿到 usage（流式计费的关键）。
 		// lastUpstreamCancel 在 attempt loop 顶部声明 + defer 兜底，
@@ -2314,6 +2785,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
 			kind := classifyTransportFailure(reqErr)
+			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
+				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/chat/completions): %v", attempt+1, account.ID(), reqErr)
+				forceHTTPAfterWSMessageTooBig = true
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				continue
+			}
 			retryable := IsRetryableError(reqErr) || kind != ""
 			shouldRetry := false
 			if retryable {
@@ -2360,25 +2838,31 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			retryExclusions.MarkHard(account.ID())
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
-			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", model, errBody)
+			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          "/v1/chat/completions",
-				Model:             model,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				ReasoningEffort:   reasoningEffort,
-				InboundEndpoint:   "/v1/chat/completions",
-				UpstreamEndpoint:  "/v1/responses",
-				Stream:            isStream,
-				ServiceTier:       serviceTier,
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/chat/completions",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				StatusCode:           resp.StatusCode,
+				DurationMs:           durationMs,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/chat/completions",
+				UpstreamEndpoint:     "/v1/responses",
+				Stream:               isStream,
+				ViaWebsocket:         useWebsocket,
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
+				IsRetryAttempt:       shouldRetry,
+				AttemptIndex:         attempt + 1,
+				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -2391,12 +2875,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			return
 		}
 
+		SyncCodexUsageState(h.store, account, resp)
+
 		// 成功！翻译响应 + TTFT 跟踪
 		account.Mu().RLock()
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
-		c.Set("x-model", model)
+		c.Set("x-model", logModel)
 		c.Set("x-reasoning-effort", reasoningEffort)
 		var firstTokenMs int
 		var usage *UsageInfo
@@ -2414,7 +2900,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		created := time.Now().Unix()
 
 		if isStream {
-			streamTranslator := NewStreamTranslator(chunkID, model, created)
+			streamTranslator := NewStreamTranslator(chunkID, responseModel, created)
 			c.Header("Content-Type", "text/event-stream")
 			c.Header("Cache-Control", "no-cache")
 			c.Header("Connection", "keep-alive")
@@ -2441,11 +2927,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
-				isFirstToken := isFirstTokenEvent(eventType)
+				ttftGuard.MarkProgress(eventType)
+				isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
-					ttftGuard.MarkEvent(eventType)
 				}
 				// 累计 delta 字符数（文本 + function call 参数）
 				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
@@ -2465,7 +2951,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 				if !clientGone && chunk != nil {
 					payload := fmt.Sprintf("data: %s\n\n", chunk)
-					shouldDefer := !ttftRecorded && !gotTerminal && !isFirstToken
+					shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
 					if shouldDefer {
 						pendingFirstTokenChunks.WriteString(payload)
 						if pendingFirstTokenChunks.Len() <= 1024*1024 {
@@ -2520,10 +3006,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
-				if !ttftRecorded && isFirstTokenEvent(eventType) {
+				ttftGuard.MarkProgress(eventType)
+				if !ttftRecorded && isFirstTokenResultForMode(parsed, currentFirstTokenMode()) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
-					ttftGuard.MarkEvent(eventType)
 				}
 				switch eventType {
 				case "response.output_text.delta":
@@ -2551,7 +3037,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return true
 			})
 
-			compactResult = BuildCompactResponse(chunkID, model, created, fullContent.String(), fullReasoning.String(), toolCalls, usage)
+			compactResult = BuildCompactResponse(chunkID, responseModel, created, fullContent.String(), fullReasoning.String(), toolCalls, usage)
 		}
 
 		// 断流检测 + token 估算
@@ -2561,13 +3047,25 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
 		ttftGuard.Stop()
+		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
+			if responseFailedDecision.Reason != "" {
+				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
+			}
+		}
+		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/chat/completions): %s", attempt+1, account.ID(), outcome.failureMessage)
+			forceHTTPAfterWSMessageTooBig = true
+			resp.Body.Close()
+			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
-			SyncCodexUsageState(h.store, account, resp)
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 			} else {
@@ -2609,23 +3107,26 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 		}
 
-		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
-		billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
-		c.Set("x-service-tier", resolvedServiceTier)
+		usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
+		c.Set("x-service-tier", usageTiers.ServiceTier)
 
 		logInput := &database.UsageLogInput{
-			AccountID:          account.ID(),
-			Endpoint:           "/v1/chat/completions",
-			Model:              model,
-			StatusCode:         logStatusCode,
-			DurationMs:         totalDuration,
-			FirstTokenMs:       firstTokenMs,
-			ReasoningEffort:    reasoningEffort,
-			InboundEndpoint:    "/v1/chat/completions",
-			UpstreamEndpoint:   "/v1/responses",
-			Stream:             isStream,
-			ServiceTier:        resolvedServiceTier,
-			BillingServiceTier: billingServiceTier,
+			AccountID:            account.ID(),
+			Endpoint:             "/v1/chat/completions",
+			Model:                logModel,
+			EffectiveModel:       logEffectiveModel,
+			StatusCode:           logStatusCode,
+			DurationMs:           totalDuration,
+			FirstTokenMs:         firstTokenMs,
+			ReasoningEffort:      reasoningEffort,
+			InboundEndpoint:      "/v1/chat/completions",
+			UpstreamEndpoint:     "/v1/responses",
+			Stream:               isStream,
+			ViaWebsocket:         useWebsocket,
+			ServiceTier:          usageTiers.ServiceTier,
+			RequestedServiceTier: usageTiers.RequestedServiceTier,
+			ActualServiceTier:    usageTiers.ActualServiceTier,
+			BillingServiceTier:   usageTiers.BillingServiceTier,
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
@@ -2643,7 +3144,6 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
-		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -2775,14 +3275,14 @@ func parseRetryAfterResetAt(body []byte, now time.Time) (time.Time, bool) {
 		return time.Time{}, false
 	}
 
-	if resetsAt := gjson.GetBytes(body, "error.resets_at").Int(); resetsAt > 0 {
+	if resetsAt := firstGJSONInt(body, "error.resets_at", "response.error.resets_at", "response.status_details.error.resets_at"); resetsAt > 0 {
 		resetTime := time.Unix(resetsAt, 0)
 		if resetTime.After(now) {
 			return resetTime, true
 		}
 	}
 
-	if secs := gjson.GetBytes(body, "error.resets_in_seconds").Int(); secs > 0 {
+	if secs := firstGJSONInt(body, "error.resets_in_seconds", "response.error.resets_in_seconds", "response.status_details.error.resets_in_seconds"); secs > 0 {
 		return now.Add(time.Duration(secs) * time.Second), true
 	}
 
@@ -2790,7 +3290,7 @@ func parseRetryAfterResetAt(body []byte, now time.Time) (time.Time, bool) {
 }
 
 func parseUsageLimitResetAt(body []byte, now time.Time) (time.Time, bool) {
-	if strings.TrimSpace(gjson.GetBytes(body, "error.type").String()) != "usage_limit_reached" {
+	if !IsUsageLimitReachedError(body) {
 		return time.Time{}, false
 	}
 	return parseRetryAfterResetAt(body, now)
@@ -2914,17 +3414,37 @@ func responseHasCodex5hHeaders(resp *http.Response) bool {
 }
 
 func classify429RateLimit(account *auth.Account, body []byte, resp *http.Response, now time.Time, model string) codex429Decision {
-	if resetAt, ok := parseUsageLimitResetAt(body, now); ok {
-		reason := "usage_limit"
-		if account != nil && account.IsPremium5hPlan() && responseHasCodex5hHeaders(resp) {
-			reason = "rate_limited_5h"
+	if IsUsageLimitReachedError(body) {
+		if resetAt, ok := parseUsageLimitResetAt(body, now); ok {
+			reason := "usage_limit"
+			if account != nil && account.IsPremium5hPlan() && responseHasCodex5hHeaders(resp) {
+				reason = "rate_limited_5h"
+			}
+			return codex429Decision{
+				Scope:    rateLimitScopeAccount,
+				Reason:   reason,
+				ResetAt:  resetAt,
+				Cooldown: resetAt.Sub(now),
+			}
 		}
-		return codex429Decision{
-			Scope:    rateLimitScopeAccount,
-			Reason:   reason,
-			ResetAt:  resetAt,
-			Cooldown: resetAt.Sub(now),
+
+		windowType, resetAt, hasWindowReset := classifyCodex429Window(resp, now)
+		switch windowType {
+		case codexRateLimitWindow5h:
+			if !hasWindowReset {
+				resetAt = now.Add(5 * time.Hour)
+			}
+			return codex429Decision{Scope: rateLimitScopeAccount, Reason: "rate_limited_5h", ResetAt: resetAt, Cooldown: resetAt.Sub(now)}
+		case codexRateLimitWindow7d:
+			if !hasWindowReset {
+				resetAt = now.Add(7 * 24 * time.Hour)
+			}
+			return codex429Decision{Scope: rateLimitScopeAccount, Reason: "rate_limited_7d", ResetAt: resetAt, Cooldown: resetAt.Sub(now)}
 		}
+
+		cooldown := usageLimitFallbackCooldown(account, body)
+		resetAt = now.Add(cooldown)
+		return codex429Decision{Scope: rateLimitScopeAccount, Reason: "usage_limit", ResetAt: resetAt, Cooldown: cooldown}
 	}
 
 	windowType, resetAt, hasWindowReset := classifyCodex429Window(resp, now)
@@ -2960,6 +3480,22 @@ func classify429RateLimit(account *auth.Account, body []byte, resp *http.Respons
 	return codex429Decision{Scope: rateLimitScopeAccount, Reason: "rate_limited", ResetAt: resetAt, Cooldown: cooldown}
 }
 
+func usageLimitFallbackCooldown(account *auth.Account, body []byte) time.Duration {
+	planType := ""
+	if details, ok := parseUsageLimitDetails(body); ok {
+		planType = details.planType
+	}
+	if planType == "" && account != nil {
+		planType = account.GetPlanType()
+	}
+	switch auth.NormalizePlanType(planType) {
+	case "free":
+		return 7 * 24 * time.Hour
+	default:
+		return 5 * time.Hour
+	}
+}
+
 // Apply429Cooldown 统一处理 429 对账号状态的影响。
 func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, resp *http.Response, model string) codex429Decision {
 	decision := classify429RateLimit(account, body, resp, time.Now(), model)
@@ -2989,6 +3525,11 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 }
 
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
+	if IsUsageLimitReachedError(body) {
+		decision := Apply429Cooldown(h.store, account, body, resp, model)
+		log.Printf("账号 %d 触发用量上限 (status=%d, plan=%s, reason=%s)，冷却到 %s", account.ID(), statusCode, account.GetPlanType(), decision.Reason, decision.ResetAt.Format(time.RFC3339))
+		return decision
+	}
 	switch statusCode {
 	case http.StatusTooManyRequests:
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
@@ -3132,6 +3673,9 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 	if store != nil {
 		if result.HasUsage7d {
 			store.PersistUsageSnapshot(account, result.UsagePct7d)
+			if result.UsagePct7d >= 100 {
+				result.Usage7dRateLimited = store.MarkUsage7dRateLimited(account)
+			}
 		} else if result.Used5hHeaders {
 			store.PersistUsageSnapshot5hOnly(account)
 			result.Persisted5hOnly = true
@@ -3234,34 +3778,32 @@ func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte)
 
 // sendFinalUpstreamError 重试用尽后的最终错误响应：识别 usage_limit_reached 改写为 503，其余透传
 func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []byte) {
-	if statusCode == http.StatusTooManyRequests {
-		if details, ok := parseUsageLimitDetails(body); ok {
-			if details.resetsInSeconds > 0 {
-				c.Header("Retry-After", fmt.Sprintf("%d", details.resetsInSeconds))
-			}
-
-			message := "账号池额度已耗尽，请稍后重试"
-			if details.message != "" {
-				message = fmt.Sprintf("%s：%s", message, details.message)
-			}
-
-			errInfo := gin.H{
-				"message": message,
-				"type":    "server_error",
-				"code":    "account_pool_usage_limit_reached",
-			}
-			if details.planType != "" {
-				errInfo["plan_type"] = details.planType
-			}
-			if details.resetsAt != 0 {
-				errInfo["resets_at"] = details.resetsAt
-			}
-			if details.resetsInSeconds != 0 {
-				errInfo["resets_in_seconds"] = details.resetsInSeconds
-			}
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errInfo})
-			return
+	if details, ok := parseUsageLimitDetails(body); ok {
+		if details.resetsInSeconds > 0 {
+			c.Header("Retry-After", fmt.Sprintf("%d", details.resetsInSeconds))
 		}
+
+		message := "账号池额度已耗尽，请稍后重试"
+		if details.message != "" {
+			message = fmt.Sprintf("%s：%s", message, details.message)
+		}
+
+		errInfo := gin.H{
+			"message": message,
+			"type":    "server_error",
+			"code":    "account_pool_usage_limit_reached",
+		}
+		if details.planType != "" {
+			errInfo["plan_type"] = details.planType
+		}
+		if details.resetsAt != 0 {
+			errInfo["resets_at"] = details.resetsAt
+		}
+		if details.resetsInSeconds != 0 {
+			errInfo["resets_in_seconds"] = details.resetsInSeconds
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errInfo})
+		return
 	}
 
 	h.sendUpstreamError(c, statusCode, body)

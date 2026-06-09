@@ -217,12 +217,40 @@ func TestPickClassifiedWhamWindows_FallsBackToPositionForUnknownSeconds(t *testi
 	primary := &WhamUsageWindow{UsedPercent: 50, LimitWindowSeconds: 0} // 未知/缺失
 	secondary := &WhamUsageWindow{UsedPercent: 20, LimitWindowSeconds: 0}
 
-	w5h, w7d := pickClassifiedWhamWindows(primary, secondary)
+	w5h, w7d := pickClassifiedWhamWindows(primary, secondary, "plus", time.Now())
 	if w5h != primary {
 		t.Errorf("expected primary→5h via position fallback, got %v", w5h)
 	}
 	if w7d != secondary {
 		t.Errorf("expected secondary→7d via position fallback, got %v", w7d)
+	}
+}
+
+func TestPickClassifiedWhamWindows_FreeUnknownPrimaryFallsBackTo7d(t *testing.T) {
+	primary := &WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 0}
+
+	w5h, w7d := pickClassifiedWhamWindows(primary, nil, "free", time.Now())
+	if w5h != nil {
+		t.Fatalf("expected no 5h window for free unknown primary, got %v", w5h)
+	}
+	if w7d != primary {
+		t.Fatalf("expected primary→7d for free unknown primary, got %v", w7d)
+	}
+}
+
+func TestPickClassifiedWhamWindows_LongResetPrimaryFallsBackTo7d(t *testing.T) {
+	primary := &WhamUsageWindow{
+		UsedPercent:        100,
+		LimitWindowSeconds: 0,
+		ResetAfterSeconds:  6 * 60 * 60,
+	}
+
+	w5h, w7d := pickClassifiedWhamWindows(primary, nil, "", time.Now())
+	if w5h != nil {
+		t.Fatalf("expected no 5h window for long reset primary, got %v", w5h)
+	}
+	if w7d != primary {
+		t.Fatalf("expected primary→7d for long reset primary, got %v", w7d)
 	}
 }
 
@@ -240,6 +268,24 @@ func TestApplyWhamUsage_MarksPremium5hLimitedAt100Percent(t *testing.T) {
 	}
 	if !account.IsPremium5hRateLimited() {
 		t.Error("account should be in premium 5h rate-limited state after ApplyWhamUsage")
+	}
+}
+
+func TestApplyWhamUsage_Marks7dLimitedAt100Percent(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 1, AccessToken: "at", PlanType: "team", Status: auth.StatusReady, HealthTier: auth.HealthTierHealthy}
+
+	now := time.Now()
+	usage := &WhamUsage{PlanType: "team"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 20, LimitWindowSeconds: 18000, ResetAt: now.Add(2 * time.Hour).Unix()}
+	usage.RateLimit.SecondaryWindow = &WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 604800, ResetAt: now.Add(5 * 24 * time.Hour).Unix()}
+
+	result := ApplyWhamUsage(store, account, usage)
+	if !result.Usage7dRateLimited {
+		t.Fatalf("Usage7dRateLimited = false, result=%+v", result)
+	}
+	if got := account.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
 	}
 }
 

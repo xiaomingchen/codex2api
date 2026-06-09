@@ -110,6 +110,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+err.Error())
 		return
 	}
+	codexBody, _, _, _ = h.applyConfiguredModelMappingToBody(codexBody, h.supportedModelIDs(c.Request.Context()))
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	if isImageOnlyModel(effectiveModel) {
 		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", effectiveModel))
@@ -125,6 +126,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	reasoningEffort := extractReasoningEffort(codexBody)
 	serviceTier := extractServiceTier(codexBody)
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
+	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 
@@ -136,6 +138,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	forceHTTPAfterWSMessageTooBig := false
 
 	var lastUpstreamCancel context.CancelFunc
 	defer func() {
@@ -158,7 +161,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
-		useWebsocket := h.shouldUseWebsocketForHTTP()
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		apiKey = strings.TrimSpace(apiKey)
@@ -179,6 +182,9 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		downstreamHeaders := c.Request.Header.Clone()
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		if useWebsocket && explicitSessionID == "" {
+			upstreamSessionID = ""
+		}
 		if lastUpstreamCancel != nil {
 			lastUpstreamCancel()
 		}
@@ -195,6 +201,13 @@ func (h *Handler) Messages(c *gin.Context) {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
 			kind := classifyTransportFailure(reqErr)
+			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
+				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/messages): %v", attempt+1, account.ID(), reqErr)
+				forceHTTPAfterWSMessageTooBig = true
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				continue
+			}
 			retryable := IsRetryableError(reqErr) || kind != ""
 			shouldRetry := false
 			if retryable {
@@ -246,22 +259,27 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          "/v1/messages",
-				Model:             model,
-				EffectiveModel:    effectiveModel,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				ReasoningEffort:   reasoningEffort,
-				InboundEndpoint:   "/v1/messages",
-				UpstreamEndpoint:  "/v1/responses",
-				Stream:            isStream,
-				ServiceTier:       resolveServiceTier("", serviceTier),
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/messages",
+				Model:                model,
+				EffectiveModel:       effectiveModel,
+				StatusCode:           resp.StatusCode,
+				DurationMs:           durationMs,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/messages",
+				UpstreamEndpoint:     "/v1/responses",
+				Stream:               isStream,
+				ViaWebsocket:         useWebsocket,
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
+				IsRetryAttempt:       shouldRetry,
+				AttemptIndex:         attempt + 1,
+				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -298,6 +316,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var terminalFailurePayload []byte
+		var anthropicResp *anthropicResponse
 
 		if isStream {
 			// 流式响应：逐事件翻译为 Anthropic SSE
@@ -324,11 +343,11 @@ func (h *Handler) Messages(c *gin.Context) {
 				eventType := parsed.Get("type").String()
 
 				// TTFT 跟踪
-				isFirstToken := isFirstTokenEvent(eventType)
+				ttftGuard.MarkProgress(eventType)
+				isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
-					ttftGuard.MarkEvent(eventType)
 				}
 
 				// 累计 delta 字符数
@@ -357,7 +376,7 @@ func (h *Handler) Messages(c *gin.Context) {
 						payload.WriteString(anthropicEventToSSE(evt))
 					}
 					payloadString := payload.String()
-					shouldDefer := !ttftRecorded && !gotTerminal && !isFirstToken
+					shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
 					if shouldDefer {
 						pendingFirstTokenEvents.WriteString(payloadString)
 						if pendingFirstTokenEvents.Len() <= 1024*1024 {
@@ -407,10 +426,10 @@ func (h *Handler) Messages(c *gin.Context) {
 				eventType := parsed.Get("type").String()
 				accumulator.apply(translator.translateEvent(data))
 
-				if !ttftRecorded && isFirstTokenEvent(eventType) {
+				ttftGuard.MarkProgress(eventType)
+				if !ttftRecorded && isFirstTokenResultForMode(parsed, currentFirstTokenMode()) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
-					ttftGuard.MarkEvent(eventType)
 				}
 				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
 					deltaCharCount += len(parsed.Get("delta").String())
@@ -433,10 +452,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			})
 
 			if lastCompletedData != nil {
-				anthropicResp := accumulator.build(lastCompletedData)
-				c.JSON(http.StatusOK, anthropicResp)
-			} else {
-				sendAnthropicError(c, http.StatusBadGateway, "api_error", "No complete response received from upstream")
+				anthropicResp = accumulator.build(lastCompletedData)
 			}
 		}
 
@@ -449,6 +465,21 @@ func (h *Handler) Messages(c *gin.Context) {
 		ttftGuard.Stop()
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+			// 流式 response.failed 也要把额度耗尽/限流账号冷却下来，
+			// 否则该账号会保持高分继续被调度（与 /v1/responses 路径保持一致）。
+			responseFailedDecision := h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
+			if responseFailedDecision.Reason != "" {
+				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
+			}
+		}
+		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/messages): %s",
+				attempt+1, account.ID(), outcome.failureMessage)
+			forceHTTPAfterWSMessageTooBig = true
+			resp.Body.Close()
+			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重试 (attempt %d/%d, account %d, /v1/messages): %s",
@@ -466,6 +497,14 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
+		}
+
+		if !isStream {
+			if anthropicResp != nil {
+				c.JSON(http.StatusOK, anthropicResp)
+			} else {
+				sendAnthropicError(c, http.StatusBadGateway, "api_error", "No complete response received from upstream")
+			}
 		}
 
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
@@ -487,22 +526,26 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 		}
 
-		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
-		c.Set("x-service-tier", resolvedServiceTier)
+		usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
+		c.Set("x-service-tier", usageTiers.ServiceTier)
 
 		logInput := &database.UsageLogInput{
-			AccountID:        account.ID(),
-			Endpoint:         "/v1/messages",
-			Model:            model,
-			EffectiveModel:   effectiveModel,
-			StatusCode:       logStatusCode,
-			DurationMs:       totalDuration,
-			FirstTokenMs:     firstTokenMs,
-			ReasoningEffort:  reasoningEffort,
-			InboundEndpoint:  "/v1/messages",
-			UpstreamEndpoint: "/v1/responses",
-			Stream:           isStream,
-			ServiceTier:      resolvedServiceTier,
+			AccountID:            account.ID(),
+			Endpoint:             "/v1/messages",
+			Model:                model,
+			EffectiveModel:       effectiveModel,
+			StatusCode:           logStatusCode,
+			DurationMs:           totalDuration,
+			FirstTokenMs:         firstTokenMs,
+			ReasoningEffort:      reasoningEffort,
+			InboundEndpoint:      "/v1/messages",
+			UpstreamEndpoint:     "/v1/responses",
+			Stream:               isStream,
+			ViaWebsocket:         useWebsocket,
+			ServiceTier:          usageTiers.ServiceTier,
+			RequestedServiceTier: usageTiers.RequestedServiceTier,
+			ActualServiceTier:    usageTiers.ActualServiceTier,
+			BillingServiceTier:   usageTiers.BillingServiceTier,
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
