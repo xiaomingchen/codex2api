@@ -777,7 +777,7 @@ export default function Accounts() {
     "all" | "pro" | "prolite" | "plus" | "team" | "k12" | "free"
   >("all");
   const [sortKey, setSortKey] = useState<
-    "requests" | "usage" | "importTime" | "schedulerPriority" | "group" | null
+    "requests" | "usage" | "importTime" | "schedulerPriority" | "group" | "cooldownUntil" | null
   >(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [addForm, setAddForm] = useState<AddAccountRequest>({
@@ -1892,6 +1892,19 @@ export default function Accounts() {
           diff = aMeta.key.localeCompare(bMeta.key, "zh");
         }
         if (diff === 0) return a.id - b.id;
+      } else if (sortKey === "cooldownUntil") {
+        const aCd = (a.cooldown_until ?? "").trim();
+        const bCd = (b.cooldown_until ?? "").trim();
+        const aHas = aCd !== "";
+        const bHas = bCd !== "";
+        if (aHas !== bHas) {
+          return aHas ? -1 : 1;
+        }
+        if (aHas && bHas) {
+          const cmp = aCd.localeCompare(bCd);
+          if (cmp !== 0) return sortDir === "asc" ? cmp : -cmp;
+        }
+        return sortDir === "asc" ? a.id - b.id : b.id - a.id;
       }
       return sortDir === "asc" ? diff : -diff;
     });
@@ -4952,6 +4965,35 @@ export default function Accounts() {
                     {t("accounts.schedulerPrioritySort")}
                   </span>
                   {sortKey === "schedulerPriority" ? (
+                    <span aria-hidden="true">
+                      {sortDir === "desc" ? "↓" : "↑"}
+                    </span>
+                  ) : null}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="min-w-0"
+                  aria-pressed={sortKey === "cooldownUntil"}
+                  title={t("accounts.cooldownSortHint")}
+                  onClick={() => {
+                    if (sortKey === "cooldownUntil") {
+                      setSortDir((current) =>
+                        current === "desc" ? "asc" : "desc",
+                      );
+                    } else {
+                      setSortKey("cooldownUntil");
+                      setSortDir("asc");
+                    }
+                    setPage(1);
+                  }}
+                >
+                  <Timer className="size-3.5" />
+                  <span className="truncate">
+                    {t("accounts.cooldownSort")}
+                  </span>
+                  {sortKey === "cooldownUntil" ? (
                     <span aria-hidden="true">
                       {sortDir === "desc" ? "↓" : "↑"}
                     </span>

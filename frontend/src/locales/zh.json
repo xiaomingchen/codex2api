@@ -874,6 +874,8 @@
     "schedulerPriorityBadgeTitle": "调度优先级：{{value}}",
     "schedulerPrioritySort": "优先级排序",
     "schedulerPrioritySortHint": "按调度优先级排序；再次点击切换升降序。",
+    "cooldownSort": "冷却恢复排序",
+    "cooldownSortHint": "有冷却的账号排前，按恢复时间排序",
     "groupSort": "分组排序",
     "groupSortHint": "按账号分组聚类排序，同一分组的账号会排在一起；再次点击切换升降序。",
     "autoPauseTitle": "用量自动暂停",

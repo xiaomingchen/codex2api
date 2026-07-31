@@ -874,6 +874,8 @@
     "schedulerPriorityBadgeTitle": "Scheduling priority: {{value}}",
     "schedulerPrioritySort": "Priority Sort",
     "schedulerPrioritySortHint": "Sort by scheduling priority; click again to switch direction.",
+    "cooldownSort": "Cooldown recovery sort",
+    "cooldownSortHint": "Accounts in cooldown first, sorted by recovery time",
     "groupSort": "Group Sort",
     "groupSortHint": "Cluster accounts by group membership so the same groups sit together; click again to switch direction.",
     "autoPauseTitle": "Usage Auto-Pause",
