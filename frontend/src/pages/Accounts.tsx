@@ -7,6 +7,9 @@ import type { ProxyRow } from "../api";
 import { ProxyField } from "../components/ProxyField";
 import AccountProxyBadge from "../components/AccountProxyBadge";
 import AccountProxyQuickEditor from "../components/AccountProxyQuickEditor";
+import AccountHrefQuickEditor, {
+  openAccountHref,
+} from "../components/AccountHrefQuickEditor";
 import SubscriptionBadge from "../components/SubscriptionBadge";
 import {
   buildProxyBindingContext,
@@ -155,6 +158,7 @@ import {
   EyeOff,
   KeyRound,
   ExternalLink,
+  Link2,
   FileText,
   FileJson,
   BarChart3,
@@ -1083,6 +1087,8 @@ interface AccountRowActions {
   openChannelMonitor: (account: AccountRow) => void;
   openQuickGroupEditor: (account: AccountRow) => void;
   openQuickProxyEditor: (account: AccountRow) => void;
+  openHrefEditor: (account: AccountRow) => void;
+  openHref: (account: AccountRow) => void;
   openUsage: (account: AccountRow) => void;
   // 直接打开用量弹窗的官方统计 tab（成本列的官方胶囊）。
   openOfficialUsage: (account: AccountRow) => void;
@@ -1602,6 +1608,25 @@ const AccountTableRow = memo(function AccountTableRow({
                                   <Button
                                     variant="ghost"
                                     size="icon-sm"
+                                    className="size-8"
+                                    onClick={() =>
+                                      account.account_href
+                                        ? actions.openHref(account)
+                                        : actions.openHrefEditor(account)
+                                    }
+                                    title={
+                                      account.account_href
+                                        ? t("accounts.hrefOpenTitle")
+                                        : t("accounts.hrefConfigTitle")
+                                    }
+                                  >
+                                    <Link2
+                                      className={`size-3.5 ${account.account_href ? "text-primary" : ""}`}
+                                    />
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon-sm"
                                     className="size-8 text-destructive hover:bg-destructive/10 hover:text-destructive"
                                     onClick={() => actions.remove(account)}
                                     title={t("accounts.deleteAccount")}
@@ -2100,6 +2125,8 @@ export default function Accounts() {
   const [quickProxyAccount, setQuickProxyAccount] = useState<AccountRow | null>(
     null,
   );
+  // 跳转地址快捷编辑：配置 account_href 或回退打开 base_url。
+  const [hrefAccount, setHrefAccount] = useState<AccountRow | null>(null);
   // OAuth 账号“支持模型”白名单编辑器状态;空白名单表示该账号可调度所有模型。
   const [modelsAccount, setModelsAccount] = useState<AccountRow | null>(null);
   const [modelsDraft, setModelsDraft] = useState<string[]>([]);
@@ -6043,6 +6070,12 @@ export default function Accounts() {
     openChannelMonitor: (account) => setChannelMonitorAccount(account),
     openQuickGroupEditor,
     openQuickProxyEditor: (account) => setQuickProxyAccount(account),
+    openHrefEditor: (account) => setHrefAccount(account),
+    openHref: (account) => {
+      if (!openAccountHref(account)) {
+        setHrefAccount(account);
+      }
+    },
     openUsage: (account) => {
       setUsageInitialPage("overview");
       setUsageAccount(account);
@@ -6071,6 +6104,8 @@ export default function Accounts() {
       openChannelMonitor: (a) => rowActionsImplRef.current?.openChannelMonitor(a),
       openQuickGroupEditor: (a) => rowActionsImplRef.current?.openQuickGroupEditor(a),
       openQuickProxyEditor: (a) => rowActionsImplRef.current?.openQuickProxyEditor(a),
+      openHrefEditor: (a) => rowActionsImplRef.current?.openHrefEditor(a),
+      openHref: (a) => rowActionsImplRef.current?.openHref(a),
       openUsage: (a) => rowActionsImplRef.current?.openUsage(a),
       openOfficialUsage: (a) => rowActionsImplRef.current?.openOfficialUsage(a),
       openTesting: (a) => rowActionsImplRef.current?.openTesting(a),
@@ -10132,6 +10167,15 @@ export default function Accounts() {
             proxies={proxyPool}
             ctx={proxyBindingCtx}
             onClose={() => setQuickProxyAccount(null)}
+            onSaved={async () => {
+              await reload();
+            }}
+          />
+
+          <AccountHrefQuickEditor
+            account={hrefAccount}
+            accountLabel={hrefAccount ? formatAccountName(hrefAccount) : ""}
+            onClose={() => setHrefAccount(null)}
             onSaved={async () => {
               await reload();
             }}
