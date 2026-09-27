@@ -1270,6 +1270,23 @@ const AccountTableRow = memo(function AccountTableRow({
                                       ? formatAccountName(account)
                                       : formatAccountListEmail(account)}
                                   </button>
+                                  <button
+                                    type="button"
+                                    className="mt-0.5 inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground/60 transition-colors hover:bg-muted hover:text-primary"
+                                    title={
+                                      account.account_href
+                                        ? t("accounts.hrefOpenTitle")
+                                        : t("accounts.hrefConfigTitle")
+                                    }
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      account.account_href
+                                        ? actions.openHref(account)
+                                        : actions.openHrefEditor(account);
+                                    }}
+                                  >
+                                    <Link2 className="size-3" />
+                                  </button>
                                   {account.effective_workspace_id && (
                                     <span
                                       className={cn(
@@ -1726,6 +1743,8 @@ const AccountCardItem = memo(function AccountCardItem({
       t={t}
       onToggleSelect={() => actions.toggleSelect(account.id)}
       onOpenDetail={() => actions.openDetail(account)}
+      onOpenHref={() => actions.openHref(account)}
+      onOpenHrefEditor={() => actions.openHrefEditor(account)}
       onEdit={() => actions.openSchedulerEditor(account)}
       onEditGroups={() => actions.openQuickGroupEditor(account)}
       onEditProxy={() => actions.openQuickProxyEditor(account)}
@@ -13645,6 +13664,8 @@ function AccountMobileCard({
   t,
   onToggleSelect,
   onOpenDetail,
+  onOpenHref,
+  onOpenHrefEditor,
   onEdit,
   onEditGroups,
   onEditProxy,
@@ -13679,6 +13700,8 @@ function AccountMobileCard({
   t: ReturnType<typeof useTranslation>["t"];
   onToggleSelect: () => void;
   onOpenDetail: () => void;
+  onOpenHref: () => void;
+  onOpenHrefEditor: () => void;
   onEdit: () => void;
   onEditGroups: () => void;
   onEditProxy: () => void;
@@ -13753,14 +13776,35 @@ function AccountMobileCard({
             {avatarInitial}
           </button>
           <div className="min-w-0 flex-1">
-            <button
-              type="button"
-              className="codex-account-card__name"
-              title={fullName}
-              onClick={onOpenDetail}
-            >
-              {displayName}
-            </button>
+            <div className="flex min-w-0 items-center gap-1">
+              <button
+                type="button"
+                className="codex-account-card__name"
+                title={fullName}
+                onClick={onOpenDetail}
+              >
+                {displayName}
+              </button>
+              {(account.account_href || account.base_url) && (
+                <button
+                  type="button"
+                  className="inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground/60 transition-colors hover:bg-muted hover:text-primary"
+                  title={
+                    account.account_href
+                      ? t("accounts.hrefOpenTitle")
+                      : t("accounts.hrefConfigTitle")
+                  }
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    account.account_href
+                      ? onOpenHref()
+                      : onOpenHrefEditor();
+                  }}
+                >
+                  <Link2 className="size-3" />
+                </button>
+              )}
+            </div>
             {chatgptAccountId && (
               <div
                 className="codex-account-card__chatgpt-id"
